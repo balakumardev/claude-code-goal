@@ -44,6 +44,15 @@ Relevant files inspected from the Codex reference implementation:
 - Distinct objective: rejected. Codex's TUI shows a replace-confirmation popup; Claude Code has no interactive popup, so the clone surfaces this as an error.
 - Token accounting: the clone's `add-tokens` CLI auto-promotes to `budget_limited` from both `active` and `paused` (single mode, matching codex's `ActiveOrStopped`). Codex's default per-turn path uses `ActiveOnly` (active + budget_limited) for mid-turn accounting.
 
+## Clone hardening beyond Codex
+
+The clone strengthens one guarantee that Codex leaves loose: **who decides a goal is complete**.
+
+- Codex lets the worker model call `update_goal(status="complete")` on itself — the model that did the work judges whether the work is done. The continuation prompt warns against proxy-signal completion but there is no independent verification.
+- The clone gates `/goal complete` behind an adversarial audit run in a separate `claude -p` subprocess. The auditor has a hostile system prompt ("prove the worker wrong"), read-only tools (`Read`, `Glob`, `Grep`, read-only `Bash(git *)` / `cat` / `find` / `pytest`; `Edit` / `Write` / `NotebookEdit` blocked via `--disallowedTools`), no access to the worker's reasoning or tool history, and must return a structured `{"verdict":"pass"|"fail","evidence":[...],"missing":[...]}` JSON object. Passing flips the goal to `complete`; failing reverts to `active` and the missing list is injected into the next continuation prompt. Auditor errors (API down, timeout, invalid JSON) hold the goal at `pending_audit` so `/goal complete` can be retried.
+- Override for false-FAIL: `/goal complete --force` (logged as `force_complete` in events) or `CLAUDE_GOAL_AUDIT_DISABLE=1` (blanket off for the session). Tunables: `CLAUDE_GOAL_AUDIT_MODEL` (default `sonnet`), `CLAUDE_GOAL_AUDIT_TIMEOUT` (default 180s).
+- New status `pending_audit` (label `audit pending`) sits between `active` and `complete` during the audit window. Stop hook blocks during `pending_audit` too, so the worker session can't end while the audit is running.
+
 ## Clone extensions not present in Codex
 
 These are additions that made sense for the Claude Code integration but do not exist in Codex:

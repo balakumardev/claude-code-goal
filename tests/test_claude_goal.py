@@ -8,11 +8,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "goal" / "scripts" / "claude_goal.py"
 
+# Default fake auditor result: always pass. Tests that exercise fail/error
+# paths pass their own CLAUDE_GOAL_AUDIT_FAKE in extra_env.
+DEFAULT_FAKE_AUDIT = json.dumps(
+    {"verdict": "pass", "evidence": ["auditor stub: objective verified"], "missing": []}
+)
+
 
 def run_goal(tmp_path, *args, session="test-session", extra_env=None):
     env = os.environ.copy()
     env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
     env["CLAUDE_GOAL_SESSION_ID"] = session
+    env.setdefault("CLAUDE_GOAL_AUDIT_FAKE", DEFAULT_FAKE_AUDIT)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -494,3 +501,227 @@ def test_resume_on_exhausted_budget_keeps_budget_limited(tmp_path):
     result = run_goal(tmp_path, "resume")
     assert result.returncode == 0, result.stderr
     assert "Status: limited by budget" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Adversarial audit gate on /goal complete.
+# ---------------------------------------------------------------------------
+
+
+def _db_path(tmp_path):
+    return str(tmp_path / "goals.sqlite")
+
+
+def _events(tmp_path):
+    """Tiny helper: list event names from the fresh DB."""
+    import sqlite3
+    conn = sqlite3.connect(_db_path(tmp_path))
+    try:
+        return [row[0] for row in conn.execute("SELECT event FROM events ORDER BY id").fetchall()]
+    finally:
+        conn.close()
+
+
+def test_audit_pass_transitions_to_complete(tmp_path):
+    assert run_goal(tmp_path, "set", "--tokens", "500", "ship").returncode == 0
+    assert run_goal(tmp_path, "add-tokens", "100").returncode == 0
+    result = run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
+            "verdict": "pass",
+            "evidence": ["src/foo.py exists", "tests pass"],
+            "missing": [],
+        })
+    })
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+    assert "Audit: PASS" in result.stdout
+    assert "tests pass" in result.stdout
+    assert "Goal achieved. Report final budget usage" in result.stdout
+    assert "audit_start" in _events(tmp_path)
+    assert "audit_pass" in _events(tmp_path)
+
+
+def test_audit_fail_reverts_to_active_with_feedback(tmp_path):
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    result = run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
+            "verdict": "fail",
+            "evidence": ["file exists"],
+            "missing": ["function renamed", "tests not covering error path"],
+        })
+    })
+    assert result.returncode == 0, result.stderr
+    assert "Audit: FAIL" in result.stdout
+    assert "function renamed" in result.stdout
+    assert "Status: active" in result.stdout
+    assert "audit_fail" in _events(tmp_path)
+
+    # Next /goal status must inject the rejection into the continuation prompt.
+    status = run_goal(tmp_path, "status")
+    assert "The adversarial auditor REJECTED" in status.stdout
+    assert "function renamed" in status.stdout
+    assert "tests not covering error path" in status.stdout
+
+
+def test_audit_error_keeps_pending_audit(tmp_path):
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    result = run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
+            "verdict": "error",
+            "message": "simulated auditor timeout",
+        })
+    })
+    assert result.returncode == 0, result.stderr
+    assert "Audit: ERROR" in result.stdout
+    assert "simulated auditor timeout" in result.stdout
+    assert "Status: audit pending" in result.stdout
+    events = _events(tmp_path)
+    assert "audit_start" in events
+    assert "audit_error" in events
+
+
+def test_force_complete_skips_audit_and_logs(tmp_path):
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # Even with a fake FAIL set, --force must bypass and mark complete.
+    result = run_goal(tmp_path, "complete", "--force", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
+            "verdict": "fail",
+            "missing": ["not really done"],
+        })
+    })
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+    # No audit summary is printed since no audit ran.
+    assert "Audit: " not in result.stdout
+    events = _events(tmp_path)
+    assert "force_complete" in events
+    assert "audit_start" not in events
+
+
+def test_audit_disable_env_skips_audit(tmp_path):
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    result = run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_AUDIT_DISABLE": "1",
+        # Fake audit would fail, but disable flag must short-circuit.
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "fail", "missing": ["x"]}),
+    })
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+    events = _events(tmp_path)
+    assert "force_complete" in events
+
+
+def test_force_via_invoke_also_bypasses_audit(tmp_path):
+    """Invoke-style `/goal complete --force` (the slash-command path) must also bypass."""
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    result = run_goal(tmp_path, "invoke", "complete --force", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "fail", "missing": ["x"]}),
+    })
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+
+
+def test_pending_audit_blocks_stop_hook(tmp_path):
+    """Stop hook must treat pending_audit like active and inject the pending template."""
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # Force an error verdict so the goal stays pending_audit.
+    assert run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "error", "message": "fake timeout"}),
+    }).returncode == 0
+
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
+    env["CLAUDE_GOAL_SESSION_ID"] = "test-session"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "stop-hook"],
+        input=json.dumps({"session_id": "test-session"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["decision"] == "block"
+    assert "adversarial auditor running in a separate" in data["reason"]
+
+
+def test_schema_migration_is_idempotent(tmp_path):
+    """Calling init_db twice on the same file must not error."""
+    # First invocation creates the DB at v2.
+    assert run_goal(tmp_path, "set", "first").returncode == 0
+    # Second invocation touches the DB again; migration should be a no-op.
+    result = run_goal(tmp_path, "status")
+    assert result.returncode == 0, result.stderr
+    assert "first" in result.stdout
+
+    # Also verify the v2 CHECK constraint accepts pending_audit.
+    import sqlite3
+    conn = sqlite3.connect(_db_path(tmp_path))
+    try:
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert user_version >= 2, user_version
+        # Inserting pending_audit directly must not violate CHECK.
+        conn.execute(
+            """
+            INSERT INTO goals (id, session_id, goal_id, objective, status,
+                tokens_used, time_used_seconds, created_at, updated_at)
+            VALUES ('x', 'probe', 'y', 'probe', 'pending_audit', 0, 0, 0, 0)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_audit_parser_handles_trailing_prose(tmp_path):
+    """Real models sometimes append prose after the JSON line; parser takes the last valid JSON."""
+    # Exercise the parser directly via the json-embedded CLAUDE_GOAL_AUDIT_FAKE,
+    # which bypasses the subprocess path but still routes through the AuditResult
+    # pipeline. (Direct end-to-end of _extract_final_json_object is unit-tested
+    # below via an import.)
+    sys.path.insert(0, str(ROOT / "goal" / "scripts"))
+    import claude_goal  # type: ignore
+
+    result = claude_goal._extract_final_json_object(
+        'blah blah\n{"verdict":"pass","evidence":[],"missing":[]}\nokay now some trailing comment'
+    )
+    assert result == {"verdict": "pass", "evidence": [], "missing": []}
+
+    # Last-match-wins: the parser takes the final JSON line when several appear.
+    result = claude_goal._extract_final_json_object(
+        '{"verdict":"fail","evidence":[],"missing":["x"]}\n\n{"verdict":"pass","evidence":[],"missing":[]}'
+    )
+    assert result == {"verdict": "pass", "evidence": [], "missing": []}
+
+    # Parser rejects no-JSON.
+    assert claude_goal._extract_final_json_object("no json here at all") is None
+
+
+def test_audit_payload_validation():
+    """The payload parser must reject malformed verdicts/shapes."""
+    sys.path.insert(0, str(ROOT / "goal" / "scripts"))
+    import claude_goal  # type: ignore
+
+    # Pass with non-empty missing is invalid (rule from the prompt).
+    r = claude_goal._parse_audit_payload(
+        '{"verdict":"pass","evidence":[],"missing":["still missing"]}'
+    )
+    assert r.verdict == "error"
+
+    # Evidence must be a list of strings.
+    r = claude_goal._parse_audit_payload(
+        '{"verdict":"pass","evidence":[1,2,3],"missing":[]}'
+    )
+    assert r.verdict == "error"
+
+    # Invalid verdict.
+    r = claude_goal._parse_audit_payload(
+        '{"verdict":"maybe","evidence":[],"missing":[]}'
+    )
+    assert r.verdict == "error"
+
+    # Valid pass.
+    r = claude_goal._parse_audit_payload(
+        '{"verdict":"pass","evidence":["x"],"missing":[]}'
+    )
+    assert r.verdict == "pass"
+    assert r.evidence == ["x"]
+

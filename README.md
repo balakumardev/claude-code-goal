@@ -48,11 +48,38 @@ If `tokens_used` crosses `token_budget`, the goal auto-transitions to `budget_li
 python3 ~/.claude/skills/goal/scripts/claude_goal.py add-tokens <N>
 ```
 
+## Completion audit
+
+`/goal complete` does not mark the goal done on its own. Instead it moves the goal to `pending_audit` and spawns an **adversarial audit** in a separate `claude -p` process with a hostile system prompt ("prove the worker wrong"), read-only tools (no Edit / Write), no shared session, and no access to the worker's reasoning. The auditor can only see the objective text and the repository on disk.
+
+Three outcomes:
+
+| Auditor says | Result |
+|---|---|
+| `pass` | Goal transitions to `complete`; budget report fires. |
+| `fail` | Goal reverts to `active`; the auditor's `missing` list is injected into the next continuation prompt so Claude has to address every item before re-running `/goal complete`. |
+| `error` (API down, timeout, malformed JSON) | Goal stays at `pending_audit`; re-running `/goal complete` retries the audit. |
+
+Override the audit (when you're sure the auditor is wrong, or when running offline):
+
+```bash
+/goal complete --force                 # one-shot override, logs `force_complete` in events
+CLAUDE_GOAL_AUDIT_DISABLE=1            # blanket disable for the current session
+```
+
+Tune the auditor via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLAUDE_GOAL_AUDIT_MODEL` | `sonnet` | Model id passed to `claude -p --model`. |
+| `CLAUDE_GOAL_AUDIT_TIMEOUT` | `180` | Seconds before the auditor is killed and treated as `error`. |
+| `CLAUDE_GOAL_AUDIT_DISABLE` | unset | `1` skips the auditor entirely (equivalent to always-`--force`). |
+
 ## Notes
 
 Claude Code custom skills do not currently expose reliable live per-turn token usage to markdown commands, so budgets are soft — use `add-tokens` to account manually (or drive it from a hook). Elapsed-time tracking is local and persistent.
 
-The Stop hook blocks Claude from stopping while the current goal is active. It stops blocking when you run `/goal pause`, `/goal clear`, or `/goal complete`.
+The Stop hook blocks Claude from stopping while the current goal is `active` or `pending_audit`. It stops blocking when you run `/goal pause`, `/goal clear`, or `/goal complete` (with a passing audit or `--force`).
 
 By default, the runaway guard allows up to 500 Stop-hook continuations for a single active goal. That high default is intentional: `/goal` is meant for long-running work where Claude may need many turns to finish. If you want a stricter cap, set `CLAUDE_GOAL_MAX_STOP_CONTINUES` before launching Claude Code:
 
