@@ -1,4 +1,4 @@
-# claude-goal
+# claude-code-goal
 
 A Codex-style `/goal` command for Claude Code.
 
@@ -7,8 +7,8 @@ It gives Claude Code a persistent local goal state, Codex-verbatim continuation 
 ## Install
 
 ```bash
-git clone https://github.com/balakumardev/claude-goal.git
-cd claude-goal
+git clone https://github.com/balakumardev/claude-code-goal.git
+cd claude-code-goal
 ./install.sh
 ```
 
