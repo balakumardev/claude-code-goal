@@ -64,8 +64,15 @@ Three outcomes:
 Override the audit (when you're sure the auditor is wrong, or when running offline):
 
 ```bash
-/goal complete --force                 # one-shot override, logs `force_complete` in events
-CLAUDE_GOAL_AUDIT_DISABLE=1            # blanket disable for the current session
+# --force requires the user to have set CLAUDE_GOAL_FORCE_OK=1 when launching
+# Claude Code. This is the guardrail against a drifting worker bypassing the
+# audit on its own: the skill's Bash tool calls don't inherit this variable,
+# so only YOU (the user) can set it.
+export CLAUDE_GOAL_FORCE_OK=1   # in the shell where you run `claude`
+/goal complete --force          # one-shot override, logs `force_complete` in events
+
+# Alternative: disable the auditor entirely for this session
+CLAUDE_GOAL_AUDIT_DISABLE=1
 ```
 
 Tune the auditor via environment variables:

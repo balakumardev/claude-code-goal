@@ -582,8 +582,10 @@ def test_audit_error_keeps_pending_audit(tmp_path):
 
 def test_force_complete_skips_audit_and_logs(tmp_path):
     assert run_goal(tmp_path, "set", "ship").returncode == 0
-    # Even with a fake FAIL set, --force must bypass and mark complete.
+    # Even with a fake FAIL set, --force must bypass and mark complete —
+    # but only when the user has explicitly set CLAUDE_GOAL_FORCE_OK=1.
     result = run_goal(tmp_path, "complete", "--force", extra_env={
+        "CLAUDE_GOAL_FORCE_OK": "1",
         "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
             "verdict": "fail",
             "missing": ["not really done"],
@@ -596,6 +598,27 @@ def test_force_complete_skips_audit_and_logs(tmp_path):
     events = _events(tmp_path)
     assert "force_complete" in events
     assert "audit_start" not in events
+
+
+def test_force_complete_rejected_without_env_var(tmp_path):
+    """Without CLAUDE_GOAL_FORCE_OK=1, --force must refuse to bypass the audit.
+
+    This is the guardrail: a drifting worker cannot rationalize
+    `/goal complete --force` on its own, because Claude Code's Bash tool
+    doesn't inherit arbitrary env vars — only the user who launched the
+    Claude Code session can set this.
+    """
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # Note: run_goal defaults set CLAUDE_GOAL_AUDIT_FAKE but NOT FORCE_OK.
+    result = run_goal(tmp_path, "complete", "--force")
+    assert result.returncode == 1
+    assert "--force is blocked" in result.stderr
+    assert "CLAUDE_GOAL_FORCE_OK=1" in result.stderr
+    # Goal must stay in whatever pre-force state it was in (active, here).
+    status = run_goal(tmp_path, "status")
+    assert "Status: active" in status.stdout
+    events = _events(tmp_path)
+    assert "force_complete" not in events
 
 
 def test_audit_disable_env_skips_audit(tmp_path):
@@ -615,6 +638,7 @@ def test_force_via_invoke_also_bypasses_audit(tmp_path):
     """Invoke-style `/goal complete --force` (the slash-command path) must also bypass."""
     assert run_goal(tmp_path, "set", "ship").returncode == 0
     result = run_goal(tmp_path, "invoke", "complete --force", extra_env={
+        "CLAUDE_GOAL_FORCE_OK": "1",
         "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "fail", "missing": ["x"]}),
     })
     assert result.returncode == 0, result.stderr
@@ -819,7 +843,8 @@ def test_marker_file_present_during_pending_audit(tmp_path):
     assert _marker_path(tmp_path).exists()
 
     # Force-complete: marker should vanish.
-    assert run_goal(tmp_path, "complete", "--force").returncode == 0
+    assert run_goal(tmp_path, "complete", "--force",
+                    extra_env={"CLAUDE_GOAL_FORCE_OK": "1"}).returncode == 0
     assert not _marker_path(tmp_path).exists()
 
 

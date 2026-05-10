@@ -851,20 +851,56 @@ class AuditResult:
 
 
 def _extract_final_json_object(text: str) -> dict[str, Any] | None:
-    """Find the last line that is a valid JSON object. Returns None on miss.
+    """Return the last parseable JSON object found anywhere in `text`.
 
-    The auditor is instructed to put the verdict on the final line. Real
-    models sometimes add a trailing newline or a trailing prose sentence, so
-    we scan from the bottom and return the last successful parse.
+    The auditor is instructed to put the verdict as a JSON object on the
+    final line, but real Sonnet output often embeds that JSON inside a
+    concluding paragraph ("…my verdict: {"verdict":"pass",…}") or uses
+    code fences. Line-anchored regex misses those.
+
+    Strategy: walk the string backwards and, for each `}`, look for the
+    matching `{` by tracking brace depth while respecting JSON string
+    quoting (escaped quotes / backslashes don't toggle in-string state).
+    Try to json.loads each candidate from widest to narrowest and return
+    the first valid dict.
     """
-    candidates = re.findall(r"^\{.*\}$", text, flags=re.MULTILINE)
-    for raw in reversed(candidates):
+    # Collect (start, end_exclusive) spans of every balanced top-level
+    # `{...}` region, scanning left-to-right with a depth counter.
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    spans.append((start, i + 1))
+                    start = -1
+    # Try from last to first; return the last one that parses as a dict.
+    for s, e in reversed(spans):
         try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return data
+            data = json.loads(text[s:e])
         except json.JSONDecodeError:
             continue
+        if isinstance(data, dict):
+            return data
     return None
 
 
@@ -936,6 +972,19 @@ def run_audit(objective: str, cwd: str) -> AuditResult:
     escaped_objective = escape_xml_text(objective)
     user_prompt = AUDIT_USER_PROMPT.format(objective=escaped_objective, cwd=cwd)
 
+    # `claude -p` treats --allowedTools / --disallowedTools as variadic, so
+    # space-separated argv slots get greedily slurped into the tool list —
+    # including the final positional prompt, which then surfaces as
+    # "Error: Input must be provided either through stdin or as a prompt
+    # argument when using --print". The =comma form confines each flag to a
+    # single argv slot and leaves the positional prompt alone.
+    allowed_tools = ",".join([
+        "Read", "Glob", "Grep",
+        "Bash(git *)", "Bash(ls *)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)",
+        "Bash(wc *)", "Bash(find *)", "Bash(grep *)", "Bash(pytest *)", "Bash(python3 *)",
+    ])
+    disallowed_tools = ",".join(["Edit", "Write", "NotebookEdit"])
+
     cmd = [
         claude_bin,
         "-p",
@@ -945,11 +994,8 @@ def run_audit(objective: str, cwd: str) -> AuditResult:
         "--output-format", "json",
         "--append-system-prompt", AUDIT_SYSTEM_PROMPT,
         "--add-dir", cwd,
-        "--allowedTools",
-        "Read", "Glob", "Grep",
-        "Bash(git *)", "Bash(ls *)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)",
-        "Bash(wc *)", "Bash(find *)", "Bash(grep *)", "Bash(pytest *)", "Bash(python3 *)",
-        "--disallowedTools", "Edit", "Write", "NotebookEdit",
+        f"--allowedTools={allowed_tools}",
+        f"--disallowedTools={disallowed_tools}",
         user_prompt,
     ]
 
@@ -978,16 +1024,27 @@ def run_audit(objective: str, cwd: str) -> AuditResult:
             f"auditor exited with code {proc.returncode}: {proc.stderr.strip()[:400]}"
         )
 
-    # --output-format json wraps the assistant output in an envelope. Prefer
-    # envelope.result; fall back to raw stdout if envelope parsing fails.
+    # --output-format json wraps the assistant output in an envelope. The
+    # concrete shape is either:
+    #   - dict  : {"result":"...", "type":"result", ...}
+    #   - list  : [{"type":"system",...}, {"type":"assistant",...}, ..., {"type":"result","result":"..."}]
+    # The list form ships every turn event, with a final item of type=result
+    # carrying the final assistant text. We extract that; on any unrecognized
+    # shape we fall back to the raw stdout (which our balanced-brace scanner
+    # can still usually handle).
     envelope_text = proc.stdout.strip()
     result_text = envelope_text
     try:
         envelope = json.loads(envelope_text)
-        if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
-            result_text = envelope["result"]
     except json.JSONDecodeError:
-        pass
+        envelope = None
+    if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
+        result_text = envelope["result"]
+    elif isinstance(envelope, list):
+        for item in reversed(envelope):
+            if isinstance(item, dict) and item.get("type") == "result" and isinstance(item.get("result"), str):
+                result_text = item["result"]
+                break
 
     return _parse_audit_payload(result_text)
 
@@ -1059,6 +1116,22 @@ def complete_goal(conn: sqlite3.Connection, sid: str, *, force: bool = False) ->
         return goal, None
 
     audit_disabled = os.environ.get("CLAUDE_GOAL_AUDIT_DISABLE") == "1"
+    if force:
+        # --force requires the user to have set CLAUDE_GOAL_FORCE_OK=1 before
+        # launching Claude Code. Claude Code does not propagate arbitrary env
+        # vars into the skill's Bash-tool subprocess, so a drifting worker
+        # cannot set this itself — only the user can. This closes the hole
+        # where a worker, seeing an auditor error, rationalizes
+        # "--force is warranted" and calls it without user involvement.
+        if os.environ.get("CLAUDE_GOAL_FORCE_OK") != "1":
+            raise ValueError(
+                "--force is blocked: the adversarial audit is the safety net, "
+                "and a worker should not bypass it on its own. If you (the user) "
+                "genuinely want to override, launch Claude Code with "
+                "`CLAUDE_GOAL_FORCE_OK=1` in the environment, then re-run "
+                "`/goal complete --force`. For most audit failures, the right "
+                "answer is to fix the missing items the auditor identified."
+            )
     if force or audit_disabled:
         detail = "force" if force else "audit_disabled_env"
         event(conn, goal["session_id"], "force_complete", detail, goal["id"])
