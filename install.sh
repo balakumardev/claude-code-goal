@@ -27,25 +27,28 @@ if settings_path.exists():
 else:
     data = {}
 
-hooks = data.setdefault("hooks", {})
-stop_hooks = hooks.setdefault("Stop", [])
-entry = {
-    "matcher": "",
-    "hooks": [
-        {
-            "type": "command",
-            "command": f"python3 {script_path} stop-hook",
-        }
-    ],
-}
 
-command = entry["hooks"][0]["command"]
-for item in stop_hooks:
-    item_hooks = item.get("hooks", [])
-    if any(hook.get("command") == command for hook in item_hooks):
-        break
-else:
-    stop_hooks.append(entry)
+def ensure_hook(bucket_name: str, command: str) -> None:
+    """Append a hook entry to settings['hooks'][bucket_name] if absent."""
+    hooks = data.setdefault("hooks", {})
+    bucket = hooks.setdefault(bucket_name, [])
+    for item in bucket:
+        for existing in item.get("hooks", []):
+            if existing.get("command") == command:
+                return
+    bucket.append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command}],
+    })
+
+
+# Stop hook: blocks the worker session from stopping while a goal is
+# active or pending_audit.
+ensure_hook("Stop", f"python3 {script_path} stop-hook")
+# SessionStart hook: propagates CLAUDE_SESSION_ID into the session's Bash
+# env so parallel Claude Code sessions stay isolated even without
+# TERM_SESSION_ID. Claude Code calls this once per session at start.
+ensure_hook("SessionStart", f"python3 {script_path} session-start-hook")
 
 settings_path.write_text(json.dumps(data, indent=2) + "\n")
 PY
@@ -53,4 +56,5 @@ PY
 echo "Installed /goal for Claude Code."
 echo "Skill: $HOME/.claude/skills/goal"
 echo "Stop hook: python3 $ROOT/goal/scripts/claude_goal.py stop-hook"
+echo "SessionStart hook: python3 $ROOT/goal/scripts/claude_goal.py session-start-hook"
 echo "State DB: $HOME/.claude/goal/goals.sqlite"

@@ -35,12 +35,20 @@ STATUS_LABELS = {
 MAX_OBJECTIVE_CHARS = 4000
 STATE_DIR = Path(os.environ.get("CLAUDE_GOAL_HOME", Path.home() / ".claude" / "goal"))
 DB_PATH = Path(os.environ.get("CLAUDE_GOAL_DB", STATE_DIR / "goals.sqlite"))
+# Marker file: exists iff at least one goal in the DB is active or pending_audit.
+# The Stop hook stats this before opening SQLite so sessions without any active
+# goal short-circuit on a single syscall. Default location co-locates with the
+# DB so tests overriding CLAUDE_GOAL_DB get isolated markers for free; the
+# explicit CLAUDE_GOAL_MARKER override is still honored.
+MARKER_PATH = Path(os.environ.get("CLAUDE_GOAL_MARKER", DB_PATH.parent / ".active"))
+# Events older than this are GC'd on goal clear/complete.
+EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 # Adversarial auditor settings. Auditor runs `claude -p` in a fresh process
 # so it can't see the worker's reasoning; only the objective + the repo.
 AUDIT_MODEL_DEFAULT = "sonnet"
 AUDIT_TIMEOUT_DEFAULT = 180
-AUDIT_DB_USER_VERSION = 2  # bump when migrations below add new columns / constraints.
+AUDIT_DB_USER_VERSION = 3  # bump when migrations below add new columns / constraints.
 
 GOAL_USAGE = "Usage: /goal <objective>"
 GOAL_USAGE_HINT = "Example: /goal improve benchmark coverage"
@@ -70,7 +78,19 @@ def _term_session_id() -> str | None:
 
 
 def session_id() -> str:
-    """Pick the most stable session id available in the current process."""
+    """Pick the most stable session id available in the current process.
+
+    Ordered by reliability:
+    1. `CLAUDE_GOAL_SESSION_ID` — explicit override (tests, manual CLI).
+    2. `CLAUDE_SESSION_ID` — Claude Code's true session id. Not set by Claude
+       Code in Bash-tool subprocesses by default; our SessionStart hook writes
+       it to $CLAUDE_ENV_FILE so subsequent Bash tool calls (including the
+       `/goal` skill invocation) see it. This is the authoritative key for
+       parallel Claude Code sessions.
+    3. `TERM_SESSION_ID` / `ITERM_SESSION_ID` — terminal-level anchor; still
+       useful when running the CLI outside a Claude Code session.
+    4. cwd hash — last-resort fallback for degenerate environments.
+    """
     for key in ("CLAUDE_GOAL_SESSION_ID", "CLAUDE_SESSION_ID"):
         value = os.environ.get(key)
         if value:
@@ -126,6 +146,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             detail TEXT,
             created_at INTEGER NOT NULL
         );
+        -- Runaway-guard queries filter by (goal_id, event, created_at).
+        -- Without this index the Stop hook scans the whole events table on
+        -- every turn of every parallel session.
+        CREATE INDEX IF NOT EXISTS events_goal_event_time
+            ON events(goal_id, event, created_at);
         """
     )
     # Forward-migrate older databases.
@@ -138,12 +163,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     if "audit_feedback" not in cols:
         conn.execute("ALTER TABLE goals ADD COLUMN audit_feedback TEXT")
 
-    # The status CHECK constraint was tightened in v2 to include
-    # 'pending_audit'. SQLite can't alter CHECK constraints in place, so
-    # rebuild the table when the stored user_version is older.
+    # Schema migrations gated on user_version so they run at most once.
+    # v2: extend status CHECK constraint to include 'pending_audit'.
+    # v3: add events_goal_event_time index for parallel-session performance.
     user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if user_version < AUDIT_DB_USER_VERSION:
+    if user_version < 2:
         _migrate_extend_status_check(conn)
+    if user_version < AUDIT_DB_USER_VERSION:
         conn.execute(f"PRAGMA user_version = {AUDIT_DB_USER_VERSION}")
     conn.commit()
 
@@ -198,6 +224,51 @@ def event(conn: sqlite3.Connection, sid: str, event_name: str, detail: str | Non
         "INSERT INTO events(goal_id, session_id, event, detail, created_at) VALUES (?, ?, ?, ?, ?)",
         (goal_id, sid, event_name, detail, now()),
     )
+
+
+def refresh_marker(conn: sqlite3.Connection) -> None:
+    """Write or remove the marker file based on current DB state.
+
+    Stop hook stats this file before opening SQLite, so every session without
+    any active/pending_audit goal pays only one syscall per turn. Must be
+    called after every status transition AND after goal inserts/deletes.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM goals WHERE status IN ('active', 'pending_audit') LIMIT 1"
+    ).fetchone()
+    try:
+        if row:
+            MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            MARKER_PATH.touch()
+        else:
+            if MARKER_PATH.exists():
+                MARKER_PATH.unlink()
+    except OSError:
+        # Marker is advisory-only; a failure to update it just means the
+        # Stop hook will take the slow path. Never propagate.
+        pass
+
+
+def gc_events(conn: sqlite3.Connection, goal_id: str | None = None) -> None:
+    """Drop events older than EVENT_RETENTION_SECONDS.
+
+    Called on clear / complete so the `events` table doesn't grow forever
+    under heavy parallel use. Scoped to `goal_id` when supplied so terminal
+    transitions only touch their own goal's tail; otherwise a global sweep.
+    """
+    cutoff = now() - EVENT_RETENTION_SECONDS
+    if goal_id:
+        execute(
+            conn,
+            "DELETE FROM events WHERE goal_id = ? AND created_at < ?",
+            (goal_id, cutoff),
+        )
+    else:
+        execute(
+            conn,
+            "DELETE FROM events WHERE created_at < ?",
+            (cutoff,),
+        )
 
 
 def fmt_elapsed(seconds: int) -> str:
@@ -414,6 +485,7 @@ def _insert_new_goal(
             (row_id, sid, goal_id, objective, status, token_budget, active_started_at, ts, ts),
         )
     event(conn, sid, "set", objective, row_id)
+    refresh_marker(conn)
     return get_goal(conn, sid)  # type: ignore[return-value]
 
 
@@ -460,6 +532,7 @@ def set_goal(conn: sqlite3.Connection, sid: str, objective: str, token_budget: i
                 (desired, new_budget, active_started_at, ts, existing["id"]),
             )
             event(conn, sid, "set", objective, existing["id"])
+            refresh_marker(conn)
             return get_goal(conn, sid)  # type: ignore[return-value]
         raise ValueError(
             "this Claude session already has a goal; use: /goal clear, then set a new goal"
@@ -505,6 +578,9 @@ def update_status(conn: sqlite3.Connection, sid: str, status: str) -> sqlite3.Ro
         (new_status, used, active_started_at, ts, completed_at, goal["id"]),
     )
     event(conn, goal["session_id"], new_status, goal_id=goal["id"])
+    refresh_marker(conn)
+    if new_status == "complete":
+        gc_events(conn, goal["id"])
     return get_goal(conn, goal["session_id"])  # type: ignore[return-value]
 
 
@@ -514,6 +590,8 @@ def clear_goal(conn: sqlite3.Connection, sid: str) -> bool:
     if goal:
         execute(conn, "DELETE FROM goals WHERE id = ?", (goal["id"],))
         event(conn, goal["session_id"], "clear", goal_id=goal["id"])
+        gc_events(conn, goal["id"])
+        refresh_marker(conn)
         return True
     return False
 
@@ -549,6 +627,7 @@ def add_tokens(conn: sqlite3.Connection, sid: str, delta: int) -> sqlite3.Row | 
         (tokens_used_after, used, status, status, ts, ts, goal["id"]),
     )
     event(conn, goal["session_id"], "tokens", str(delta), goal["id"])
+    refresh_marker(conn)
     return get_goal(conn, goal["session_id"])
 
 
@@ -1151,6 +1230,11 @@ def stop_hook() -> int:
     end its turn during the audit window (auditor runs in a separate `claude -p`
     subprocess; if the worker session ended, nothing would surface the audit
     result to the user).
+
+    Early-out: if the marker file is absent, no goal in the DB is active or
+    pending_audit — return immediately without opening SQLite. This matters
+    for parallel Claude Code sessions where most sessions have no goal; we
+    don't want each of them paying a SQLite open on every turn.
     """
     try:
         data = json.load(sys.stdin)
@@ -1158,6 +1242,12 @@ def stop_hook() -> int:
         data = {}
     if not isinstance(data, dict):
         data = {}
+
+    # Fast path: no marker ⇒ no active goals anywhere ⇒ nothing to do.
+    # Worst case (marker exists but refers to another session's goal) still
+    # leaves candidates filtering to do the real work inside the DB.
+    if not MARKER_PATH.exists():
+        return 0
 
     candidates = candidate_session_ids(data)
 
@@ -1201,6 +1291,48 @@ def stop_hook() -> int:
         return 0
 
 
+def session_start_hook() -> int:
+    """Propagate Claude Code's true session_id into the session's Bash env.
+
+    Claude Code sets CLAUDE_SESSION_ID only for hook subprocesses, not for
+    Bash tool calls made from inside a skill. By writing the value to
+    $CLAUDE_ENV_FILE in a SessionStart hook, every subsequent Bash tool call
+    in that session (including `/goal set` invoking claude_goal.py) inherits
+    it — giving us a stable, truly unique key per parallel session.
+
+    Writing CLAUDE_GOAL_MARKER too lets each session point at its own marker
+    directory if the user overrode CLAUDE_GOAL_HOME.
+    """
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    sid = data.get("session_id")
+    if not sid or not isinstance(sid, str):
+        return 0
+
+    env_file = os.environ.get("CLAUDE_ENV_FILE")
+    if not env_file:
+        # Without $CLAUDE_ENV_FILE the SessionStart hook is no-op; we don't
+        # log this because Claude Code only exposes $CLAUDE_ENV_FILE for the
+        # specific hook events listed in its docs (SessionStart is one), so
+        # absence means we're being run in an unexpected context.
+        return 0
+
+    try:
+        with open(env_file, "a", encoding="utf-8") as fh:
+            # Only export — never overwrite a value the user set explicitly.
+            fh.write(f"export CLAUDE_SESSION_ID=${{CLAUDE_SESSION_ID:-{shlex.quote(sid)}}}\n")
+    except OSError:
+        # Same advisory-only treatment as refresh_marker: failure just means
+        # we fall back to TERM_SESSION_ID / cwd hash for this session.
+        pass
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] in {"invoke", "set"}:
         cmd = argv[0]
@@ -1234,6 +1366,7 @@ def main(argv: list[str]) -> int:
     p_tokens = sub.add_parser("add-tokens", help="Increment tokens_used; auto-promotes to budget_limited if budget crossed")
     p_tokens.add_argument("delta", type=int)
     sub.add_parser("stop-hook")
+    sub.add_parser("session-start-hook", help="SessionStart hook: propagate CLAUDE_SESSION_ID into Bash env")
     args = parser.parse_args(argv)
 
     try:
@@ -1273,6 +1406,8 @@ def main(argv: list[str]) -> int:
                     print(render_goal_json(find_goal(conn, candidate_session_ids())))
         elif args.cmd == "stop-hook":
             return stop_hook()
+        elif args.cmd == "session-start-hook":
+            return session_start_hook()
         else:
             parser.print_help()
             return 2

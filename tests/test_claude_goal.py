@@ -725,3 +725,226 @@ def test_audit_payload_validation():
     assert r.verdict == "pass"
     assert r.evidence == ["x"]
 
+
+# ---------------------------------------------------------------------------
+# Parallel-session hardening: session-id anchoring, marker file, events index.
+# ---------------------------------------------------------------------------
+
+
+def _marker_path(tmp_path):
+    return tmp_path / ".active"
+
+
+def test_claude_session_id_trumps_term_session_id(tmp_path):
+    """CLAUDE_SESSION_ID is authoritative even when TERM_SESSION_ID is also present."""
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
+    env.pop("CLAUDE_GOAL_SESSION_ID", None)
+    env["CLAUDE_SESSION_ID"] = "real-session-abc"
+    env["TERM_SESSION_ID"] = "iterm-tab-xyz"
+    env.setdefault("CLAUDE_GOAL_AUDIT_FAKE", DEFAULT_FAKE_AUDIT)
+
+    set_a = subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "anchored by claude id"],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert set_a.returncode == 0, set_a.stderr
+
+    # Different CLAUDE_SESSION_ID, SAME TERM_SESSION_ID: should NOT see the goal.
+    env_b = env.copy()
+    env_b["CLAUDE_SESSION_ID"] = "different-session-def"
+    status_b = subprocess.run(
+        [sys.executable, str(SCRIPT), "status"],
+        env=env_b, text=True, capture_output=True, check=False,
+    )
+    assert status_b.returncode == 0, status_b.stderr
+    assert "No goal is currently set" in status_b.stdout
+
+
+def test_session_start_hook_writes_env_file(tmp_path):
+    """SessionStart hook appends `export CLAUDE_SESSION_ID=...` to $CLAUDE_ENV_FILE."""
+    env_file = tmp_path / "env"
+    env_file.write_text("")  # pre-existing content preserved by append
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
+    env["CLAUDE_ENV_FILE"] = str(env_file)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "session-start-hook"],
+        input=json.dumps({"session_id": "hook-provided-sid"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    body = env_file.read_text()
+    assert "CLAUDE_SESSION_ID" in body
+    assert "hook-provided-sid" in body
+
+
+def test_session_start_hook_noop_without_env_file(tmp_path):
+    """If CLAUDE_ENV_FILE is unset, the hook silently exits 0 without touching anything."""
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
+    env.pop("CLAUDE_ENV_FILE", None)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "session-start-hook"],
+        input=json.dumps({"session_id": "anything"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_marker_file_exists_while_goal_active(tmp_path):
+    assert not _marker_path(tmp_path).exists()
+    assert run_goal(tmp_path, "set", "watch me").returncode == 0
+    assert _marker_path(tmp_path).exists()
+
+    # Paused ⇒ marker gone.
+    assert run_goal(tmp_path, "pause").returncode == 0
+    assert not _marker_path(tmp_path).exists()
+
+    # Resume ⇒ marker back.
+    assert run_goal(tmp_path, "resume").returncode == 0
+    assert _marker_path(tmp_path).exists()
+
+    # Clear ⇒ marker gone.
+    assert run_goal(tmp_path, "clear").returncode == 0
+    assert not _marker_path(tmp_path).exists()
+
+
+def test_marker_file_present_during_pending_audit(tmp_path):
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # Force an error verdict so the goal lands in pending_audit.
+    assert run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "error", "message": "fake"}),
+    }).returncode == 0
+    assert _marker_path(tmp_path).exists()
+
+    # Force-complete: marker should vanish.
+    assert run_goal(tmp_path, "complete", "--force").returncode == 0
+    assert not _marker_path(tmp_path).exists()
+
+
+def test_stop_hook_short_circuits_without_marker(tmp_path):
+    """Stop hook must return immediately when no marker file exists."""
+    # Don't set a goal; marker will not exist.
+    assert not _marker_path(tmp_path).exists()
+
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
+    env["CLAUDE_GOAL_SESSION_ID"] = "test-session"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "stop-hook"],
+        input=json.dumps({"session_id": "test-session"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    # Most importantly: the DB file should NOT have been created by the hook
+    # (short-circuit happened before sqlite_connect).
+    assert not (tmp_path / "goals.sqlite").exists()
+
+
+def test_events_index_exists(tmp_path):
+    """Composite index (goal_id, event, created_at) must be created for query perf."""
+    assert run_goal(tmp_path, "set", "x").returncode == 0
+
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "goals.sqlite"))
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='events'"
+        ).fetchall()
+        assert any("events_goal_event_time" == r[0] for r in rows), rows
+    finally:
+        conn.close()
+
+
+def test_events_gc_on_clear(tmp_path):
+    """gc_events(goal_id) drops rows older than the retention window."""
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # Inject an ancient event row directly; clear should drop it.
+    import sqlite3
+    db = str(tmp_path / "goals.sqlite")
+    conn = sqlite3.connect(db)
+    try:
+        (goal_id,) = conn.execute("SELECT id FROM goals LIMIT 1").fetchone()
+        conn.execute(
+            "INSERT INTO events(goal_id, session_id, event, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+            (goal_id, "test-session", "stop_continue", None, 1),  # epoch 1 = ancient
+        )
+        conn.commit()
+        ancient_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at < 1000"
+        ).fetchone()[0]
+        assert ancient_count == 1
+    finally:
+        conn.close()
+
+    assert run_goal(tmp_path, "clear").returncode == 0
+
+    conn = sqlite3.connect(db)
+    try:
+        ancient_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at < 1000"
+        ).fetchone()[0]
+        assert ancient_count == 0
+    finally:
+        conn.close()
+
+
+def test_parallel_sessions_stay_isolated(tmp_path):
+    """Two CLAUDE_SESSION_IDs in the same DB file run independent goals concurrently."""
+    db = str(tmp_path / "goals.sqlite")
+
+    def env_for(sid):
+        env = os.environ.copy()
+        env["CLAUDE_GOAL_DB"] = db
+        env.pop("CLAUDE_GOAL_SESSION_ID", None)
+        env.pop("TERM_SESSION_ID", None)
+        env["CLAUDE_SESSION_ID"] = sid
+        env["CLAUDE_GOAL_AUDIT_FAKE"] = DEFAULT_FAKE_AUDIT
+        return env
+
+    # Session A: set a goal.
+    a = subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "session A objective"],
+        env=env_for("alpha"), text=True, capture_output=True, check=False,
+    )
+    assert a.returncode == 0, a.stderr
+
+    # Session B: set a different goal.
+    b = subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "session B objective"],
+        env=env_for("bravo"), text=True, capture_output=True, check=False,
+    )
+    assert b.returncode == 0, b.stderr
+
+    # Each session sees only its own.
+    status_a = subprocess.run(
+        [sys.executable, str(SCRIPT), "status"],
+        env=env_for("alpha"), text=True, capture_output=True, check=False,
+    )
+    assert "session A objective" in status_a.stdout
+    assert "session B objective" not in status_a.stdout
+
+    status_b = subprocess.run(
+        [sys.executable, str(SCRIPT), "status"],
+        env=env_for("bravo"), text=True, capture_output=True, check=False,
+    )
+    assert "session B objective" in status_b.stdout
+    assert "session A objective" not in status_b.stdout
+
+    # Completing A must not touch B.
+    assert subprocess.run(
+        [sys.executable, str(SCRIPT), "complete"],
+        env=env_for("alpha"), text=True, capture_output=True, check=False,
+    ).returncode == 0
+
+    # A is complete, B is still active, marker still exists because of B.
+    assert _marker_path(tmp_path).exists()
+    status_b2 = subprocess.run(
+        [sys.executable, str(SCRIPT), "status"],
+        env=env_for("bravo"), text=True, capture_output=True, check=False,
+    )
+    assert "Status: active" in status_b2.stdout
+
+

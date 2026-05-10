@@ -16,6 +16,7 @@ This installs:
 
 - `~/.claude/skills/goal` as a symlink to this repo's `goal/` directory
 - a user-level Claude Code `Stop` hook in `~/.claude/settings.json`
+- a user-level Claude Code `SessionStart` hook that exports `CLAUDE_SESSION_ID` into each session's Bash env, so parallel Claude Code sessions stay isolated even when `TERM_SESSION_ID` isn't reliable (tmux, ssh, VS Code terminals).
 
 The `goal/` directory is the Claude skill package. It contains `SKILL.md`, `scripts/claude_goal.py`, and reference notes.
 
@@ -80,6 +81,14 @@ Tune the auditor via environment variables:
 Claude Code custom skills do not currently expose reliable live per-turn token usage to markdown commands, so budgets are soft — use `add-tokens` to account manually (or drive it from a hook). Elapsed-time tracking is local and persistent.
 
 The Stop hook blocks Claude from stopping while the current goal is `active` or `pending_audit`. It stops blocking when you run `/goal pause`, `/goal clear`, or `/goal complete` (with a passing audit or `--force`).
+
+### Parallel sessions
+
+The skill is designed to work across many concurrent Claude Code sessions:
+
+- Each session is keyed by its real Claude Code session id (`CLAUDE_SESSION_ID`) via the `SessionStart` hook, so two sessions in the same repo / terminal tab never collide.
+- The Stop hook stats a marker file at `~/.claude/goal/.active` before touching SQLite — sessions without any active goal pay one syscall per turn, not a DB open.
+- The `events` table carries a composite index on `(goal_id, event, created_at)` so the runaway-guard query stays fast under heavy use. Events older than 30 days are GC'd on every `/goal clear` and successful `/goal complete`.
 
 By default, the runaway guard allows up to 500 Stop-hook continuations for a single active goal. That high default is intentional: `/goal` is meant for long-running work where Claude may need many turns to finish. If you want a stricter cap, set `CLAUDE_GOAL_MAX_STOP_CONTINUES` before launching Claude Code:
 
