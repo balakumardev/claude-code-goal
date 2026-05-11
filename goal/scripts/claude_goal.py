@@ -84,6 +84,9 @@ AUDIT_MODES = {"adversarial", "self", "off"}
 AUDIT_MODEL_DEFAULT = "sonnet"
 AUDIT_TIMEOUT_DEFAULT = 180
 AUDIT_DB_USER_VERSION = 3  # bump when migrations below add new columns / constraints.
+AUDIT_BYPASS_MODES = {"self", "off"}
+FORCE_OK_ENV = "CLAUDE_GOAL_FORCE_OK"
+FORCE_LAUNCH_OK_ENV = "CLAUDE_GOAL_FORCE_LAUNCH_OK"
 
 GOAL_USAGE = "Usage: /goal <objective>"
 GOAL_USAGE_HINT = "Example: /goal improve benchmark coverage"
@@ -95,6 +98,19 @@ GOAL_TOO_LONG_FILE_HINT = (
 
 def now() -> int:
     return int(time.time())
+
+
+def audit_bypass_approved() -> bool:
+    """Return true only for audit bypasses approved at Claude session start.
+
+    This is defense-in-depth for accidental or one-command bypasses. Claude Code
+    plugins cannot create a hard security boundary against a model that can run
+    arbitrary shell commands in the user's workspace.
+    """
+    return (
+        os.environ.get(FORCE_OK_ENV) == "1"
+        and os.environ.get(FORCE_LAUNCH_OK_ENV) == "1"
+    )
 
 
 def _term_session_id() -> str | None:
@@ -217,6 +233,14 @@ def load_config() -> dict[str, Any]:
             file=sys.stderr,
         )
         config["mode"] = _AUDIT_DEFAULTS["mode"]
+    if config["mode"] in AUDIT_BYPASS_MODES and not audit_bypass_approved():
+        print(
+            f"goal warning: audit.mode={config['mode']!r} weakens the adversarial audit. "
+            f"Launch Claude Code with {FORCE_OK_ENV}=1 to enable this unsafe mode; "
+            f"falling back to {_AUDIT_DEFAULTS['mode']!r}.",
+            file=sys.stderr,
+        )
+        config["mode"] = _AUDIT_DEFAULTS["mode"]
     try:
         config["timeout"] = int(config["timeout"])
         if config["timeout"] <= 0:
@@ -254,6 +278,12 @@ def write_config(key: str, value: str) -> dict[str, Any]:
         if value not in AUDIT_MODES:
             raise ValueError(
                 f"audit.mode must be one of {sorted(AUDIT_MODES)}, got {value!r}"
+            )
+        if value in AUDIT_BYPASS_MODES and not audit_bypass_approved():
+            raise ValueError(
+                f"audit.mode={value!r} disables or weakens the adversarial audit. "
+                f"Launch Claude Code with {FORCE_OK_ENV}=1 before changing to this mode. "
+                "This is an unsafe convenience switch, not a security boundary."
             )
         coerced = value
     elif field_name == "timeout":
@@ -606,6 +636,47 @@ def find_goal(
     return None
 
 
+def _has_stable_session_anchor() -> bool:
+    return bool(
+        os.environ.get("CLAUDE_GOAL_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+        or _term_session_id()
+    )
+
+
+def _single_open_goal(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """Fallback for degenerate cwd-hash sessions with no stable anchor."""
+    rows = conn.execute(
+        """
+        SELECT * FROM goals
+        WHERE status IN ('active', 'paused', 'budget_limited', 'pending_audit')
+        ORDER BY updated_at DESC
+        LIMIT 2
+        """
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _reanchor_goal_if_needed(
+    conn: sqlite3.Connection,
+    goal: sqlite3.Row,
+    sid: str,
+) -> sqlite3.Row:
+    """Move fallback-identified goals onto the current best session id."""
+    if goal["session_id"] == sid:
+        return goal
+    if get_goal(conn, sid):
+        return goal
+    execute(
+        conn,
+        "UPDATE goals SET session_id = ?, updated_at = ? WHERE id = ?",
+        (sid, now(), goal["id"]),
+    )
+    return get_goal(conn, sid) or goal
+
+
 def validate_objective(objective: str) -> str:
     """Mirror codex-rs/protocol/src/protocol.rs::validate_thread_goal_objective.
 
@@ -654,13 +725,13 @@ def _insert_new_goal(
             conn,
             """
             UPDATE goals
-            SET goal_id = ?, objective = ?, status = ?, token_budget = ?,
+            SET session_id = ?, goal_id = ?, objective = ?, status = ?, token_budget = ?,
                 tokens_used = 0, time_used_seconds = 0,
                 active_started_at = ?, created_at = ?, updated_at = ?,
-                completed_at = NULL
+                completed_at = NULL, audit_verdict = NULL, audit_feedback = NULL
             WHERE id = ?
             """,
-            (goal_id, objective, status, token_budget, active_started_at, ts, ts, existing_id),
+            (sid, goal_id, objective, status, token_budget, active_started_at, ts, ts, existing_id),
         )
     else:
         execute(
@@ -695,8 +766,11 @@ def set_goal(conn: sqlite3.Connection, sid: str, objective: str, token_budget: i
     objective = validate_objective(objective)
     if token_budget is not None and token_budget <= 0:
         raise ValueError("goal budgets must be positive when provided")
-    existing = get_goal(conn, sid)
+    existing = find_goal(conn, candidate_session_ids())
+    if not existing and not _has_stable_session_anchor():
+        existing = _single_open_goal(conn)
     if existing:
+        existing = _reanchor_goal_if_needed(conn, existing, sid)
         if existing["objective"] == objective:
             if existing["status"] == "complete":
                 # Codex: same objective on a complete goal replaces the row.
@@ -822,27 +896,33 @@ def add_tokens(conn: sqlite3.Connection, sid: str, delta: int) -> sqlite3.Row | 
 
 
 def parse_set_args(raw: str) -> tuple[str, int | None]:
-    tokens = shlex.split(raw)
     token_budget = None
-    out: list[str] = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t in {"--tokens", "--token-budget", "--budget"}:
-            i += 1
-            if i >= len(tokens):
-                raise ValueError(f"{t} requires a value")
-            token_budget = parse_tokens(tokens[i])
-        elif t.startswith("--tokens="):
-            token_budget = parse_tokens(t.split("=", 1)[1])
-        elif t.startswith("--token-budget="):
-            token_budget = parse_tokens(t.split("=", 1)[1])
-        elif t.startswith("--budget="):
-            token_budget = parse_tokens(t.split("=", 1)[1])
-        else:
-            out.append(t)
-        i += 1
-    return " ".join(out), token_budget
+    spans: list[tuple[int, int]] = []
+    flag_pattern = re.compile(
+        r"(?<!\S)(?P<flag>--tokens|--token-budget|--budget)"
+        r"(?:=(?P<eq>\S+)|\s+(?P<space>\S+))"
+    )
+    for match in flag_pattern.finditer(raw):
+        value = match.group("eq") or match.group("space")
+        token_budget = parse_tokens(value)
+        spans.append(match.span())
+
+    missing_pattern = re.compile(r"(?<!\S)(--tokens|--token-budget|--budget)\s*$")
+    missing = missing_pattern.search(raw)
+    if missing:
+        flag = missing.group(1)
+        raise ValueError(f"{flag} requires a value")
+
+    if not spans:
+        return raw.strip(), token_budget
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        pieces.append(raw[cursor:start])
+        cursor = end
+    pieces.append(raw[cursor:])
+    return " ".join("".join(pieces).split()), token_budget
 
 
 def _commands_hint(status: str) -> str:
@@ -1118,6 +1198,8 @@ def _fake_audit_from_env() -> AuditResult | None:
     Set `CLAUDE_GOAL_AUDIT_FAKE` to a JSON string matching AuditResult's
     fields. Used by the test suite; never documented for end users.
     """
+    if os.environ.get("CLAUDE_GOAL_TESTING") != "1":
+        return None
     raw = os.environ.get("CLAUDE_GOAL_AUDIT_FAKE")
     if not raw:
         return None
@@ -1171,10 +1253,19 @@ def run_audit(objective: str, cwd: str, *, config: dict[str, Any] | None = None)
     # single argv slot and leaves the positional prompt alone.
     allowed_tools = ",".join([
         "Read", "Glob", "Grep",
-        "Bash(git *)", "Bash(ls *)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)",
-        "Bash(wc *)", "Bash(find *)", "Bash(grep *)", "Bash(pytest *)", "Bash(python3 *)",
+        "Bash(git status*)", "Bash(git diff*)", "Bash(git show*)",
+        "Bash(git log*)", "Bash(git ls-files*)",
+        "Bash(ls *)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)",
+        "Bash(wc *)", "Bash(grep *)", "Bash(pytest *)",
     ])
-    disallowed_tools = ",".join(["Edit", "Write", "NotebookEdit"])
+    disallowed_tools = ",".join([
+        "Edit", "Write", "NotebookEdit",
+        "Bash(git add*)", "Bash(git apply*)", "Bash(git checkout*)",
+        "Bash(git clean*)", "Bash(git commit*)", "Bash(git merge*)",
+        "Bash(git rebase*)", "Bash(git reset*)", "Bash(git restore*)",
+        "Bash(git switch*)", "Bash(git worktree*)", "Bash(python3 *)",
+        "Bash(python *)",
+    ])
 
     cmd = [
         claude_bin,
@@ -1194,6 +1285,11 @@ def run_audit(objective: str, cwd: str, *, config: dict[str, Any] | None = None)
     env = os.environ.copy()
     env.pop("CLAUDE_GOAL_SESSION_ID", None)
     env.pop("CLAUDE_SESSION_ID", None)
+    env.pop(FORCE_OK_ENV, None)
+    env.pop(FORCE_LAUNCH_OK_ENV, None)
+    env.pop("CLAUDE_GOAL_AUDIT_FAKE", None)
+    env.pop("CLAUDE_GOAL_TESTING", None)
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
     try:
         proc = subprocess.run(
@@ -1319,13 +1415,14 @@ def complete_goal(conn: sqlite3.Connection, sid: str, *, force: bool = False) ->
     # --force handling: only meaningful in adversarial mode. In self/off
     # the audit doesn't run anyway, so --force is a silent no-op.
     if force and mode == "adversarial":
-        if os.environ.get("CLAUDE_GOAL_FORCE_OK") != "1":
+        if not audit_bypass_approved():
             raise ValueError(
                 "--force is blocked: the adversarial audit is the safety net, "
-                "and a worker should not bypass it on its own. If you (the user) "
-                "genuinely want to override, launch Claude Code with "
-                "`CLAUDE_GOAL_FORCE_OK=1` in the environment, then re-run "
-                "`/goal complete --force`. For most audit failures, the right "
+                "and one-command environment overrides are ignored. If you "
+                "(the user) genuinely want to override, launch Claude Code with "
+                f"`{FORCE_OK_ENV}=1` in the environment so the SessionStart hook "
+                "can record approval, then re-run `/goal complete --force`. "
+                "For most audit failures, the right "
                 "answer is to fix the missing items the auditor identified."
             )
         event(conn, goal["session_id"], "force_complete", "force", goal["id"])
@@ -1604,11 +1701,31 @@ def stop_hook() -> int:
             (goal["id"], goal["active_started_at"] or goal["created_at"]),
         ).fetchone()[0]
         if recent_count >= max_continues:
+            used = active_time(goal)
+            ts = now()
+            execute(
+                conn,
+                """
+                UPDATE goals
+                SET status = 'paused', time_used_seconds = ?, active_started_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (used, ts, goal["id"]),
+            )
+            event(
+                conn,
+                goal["session_id"],
+                "auto_pause",
+                f"max_stop_continues={max_continues}",
+                goal["id"],
+            )
+            refresh_marker(conn)
             print(json.dumps({
-                "continue": True,
-                "stopReason": (
-                    f"/goal auto-continuation stopped after {max_continues} Stop-hook continuations. "
-                    "Run /goal resume or raise CLAUDE_GOAL_MAX_STOP_CONTINUES to continue automatically."
+                "decision": "block",
+                "reason": (
+                    f"/goal auto-continuation paused after {max_continues} Stop-hook continuations. "
+                    "Tell the user what remains, then stop. They can run /goal resume or raise "
+                    "CLAUDE_GOAL_MAX_STOP_CONTINUES to continue automatically."
                 ),
             }))
             return 0
@@ -1636,8 +1753,9 @@ def session_start_hook() -> int:
     in that session (including `/goal set` invoking claude_goal.py) inherits
     it — giving us a stable, truly unique key per parallel session.
 
-    Writing CLAUDE_GOAL_MARKER too lets each session point at its own marker
-    directory if the user overrode CLAUDE_GOAL_HOME.
+    If the user launched Claude Code with CLAUDE_GOAL_FORCE_OK=1, writing a
+    launch-scoped companion flag lets later /goal complete --force distinguish
+    that from a one-command environment prefix.
     """
     try:
         data = json.load(sys.stdin)
@@ -1662,6 +1780,8 @@ def session_start_hook() -> int:
         with open(env_file, "a", encoding="utf-8") as fh:
             # Only export — never overwrite a value the user set explicitly.
             fh.write(f"export CLAUDE_SESSION_ID=${{CLAUDE_SESSION_ID:-{shlex.quote(sid)}}}\n")
+            if os.environ.get(FORCE_OK_ENV) == "1":
+                fh.write(f"export {FORCE_LAUNCH_OK_ENV}=1\n")
     except OSError:
         # Same advisory-only treatment as refresh_marker: failure just means
         # we fall back to TERM_SESSION_ID / cwd hash for this session.

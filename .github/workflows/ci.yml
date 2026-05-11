@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  # If multiple commits land while CI is running, drop the stale ones so
+  # only the newest commit's CI run survives. Keeps release.yml from
+  # racing a stale green run.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Validate + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Pinned 3.11 because tomllib (used by the config loader) landed
+          # in stdlib there. 3.10 and older gracefully degrade at runtime
+          # but the test suite requires the real module.
+          python-version: '3.11'
+
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Validate plugin manifest
+        run: claude plugin validate .
+
+      - name: Run test suite
+        run: python3 -m pytest tests -v

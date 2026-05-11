@@ -42,9 +42,9 @@ python3 "$CLAUDE_PLUGIN_ROOT/goal/scripts/claude_goal.py" add-tokens <N>
 
 ## Completion audit
 
-Runs by default on every `/goal complete`. You can switch to `self` mode (codex-default: worker marks itself complete) or `off` mode via `/goal config set audit.mode <value>`.
+Runs by default on every `/goal complete`. You can switch to `self` mode (codex-default: worker marks itself complete) or `off` mode via `/goal config set audit.mode <value>`, but those weaker modes require launch-time `CLAUDE_GOAL_FORCE_OK=1` approval.
 
-`/goal complete` does not mark the goal done on its own. Instead it moves the goal to `pending_audit` and spawns an **adversarial audit** in a separate `claude -p` process with a hostile system prompt ("prove the worker wrong"), read-only tools (no Edit / Write), no shared session, and no access to the worker's reasoning. The auditor can only see the objective text and the repository on disk.
+`/goal complete` does not mark the goal done on its own. Instead it moves the goal to `pending_audit` and spawns an **adversarial audit** in a separate `claude -p` process with a hostile system prompt ("prove the worker wrong"), write tools disabled, a narrowed Bash allowlist, no shared session, and no access to the worker's reasoning. The auditor can only see the objective text and the repository on disk.
 
 Three outcomes:
 
@@ -57,16 +57,19 @@ Three outcomes:
 Override the audit (when you're sure the auditor is wrong, or when running offline):
 
 ```bash
-# --force requires the user to have set CLAUDE_GOAL_FORCE_OK=1 when launching
-# Claude Code. This is the guardrail against a drifting worker bypassing the
-# audit on its own: the skill's Bash tool calls don't inherit this variable,
-# so only YOU (the user) can set it.
+# --force requires CLAUDE_GOAL_FORCE_OK=1 when launching Claude Code.
+# The SessionStart hook records that launch-time approval and one-command
+# environment prefixes are rejected.
 export CLAUDE_GOAL_FORCE_OK=1   # in the shell where you run `claude`
 /goal complete --force          # one-shot override, logs `force_complete` in events
 
-# Alternative: disable the auditor entirely for this session
+# Alternative: disable the auditor entirely for this approved session
 CLAUDE_GOAL_AUDIT_DISABLE=1
 ```
+
+This is a convenience guardrail, not a hard security boundary: a Claude Code
+plugin runs in the same local environment as the worker and cannot reliably
+distinguish a malicious shell command from a human-typed command.
 
 Tune the auditor via environment variables:
 
@@ -74,7 +77,7 @@ Tune the auditor via environment variables:
 |---|---|---|
 | `CLAUDE_GOAL_AUDIT_MODEL` | `sonnet` | Model id passed to `claude -p --model`. |
 | `CLAUDE_GOAL_AUDIT_TIMEOUT` | `180` | Seconds before the auditor is killed and treated as `error`. |
-| `CLAUDE_GOAL_AUDIT_DISABLE` | unset | `1` skips the auditor entirely (legacy alias for `audit.mode = off`). |
+| `CLAUDE_GOAL_AUDIT_DISABLE` | unset | `1` skips the auditor entirely only when the session was launched with `CLAUDE_GOAL_FORCE_OK=1` (legacy alias for `audit.mode = off`). |
 
 ## Configuration
 
@@ -89,9 +92,9 @@ timeout = 180
 
 ### Audit modes
 
-- `adversarial` (default) — spawns `claude -p` as a separate session to verify the objective was met. Hostile system prompt, read-only tools, independent session. `/goal complete --force` still requires `CLAUDE_GOAL_FORCE_OK=1` in the shell that launched Claude Code.
-- `self` — skips the subprocess and trusts the worker's own completion claim. This is the pre-audit codex-default behavior (the worker marks itself complete after the seven-bullet audit). Logs a `self_audit` event. `--force` is a no-op here because there is nothing to force past.
-- `off` — no audit at all. Legacy alias for `CLAUDE_GOAL_AUDIT_DISABLE=1`. Logs `force_complete`.
+- `adversarial` (default) — spawns `claude -p` as a separate session to verify the objective was met. Hostile system prompt, independent session, and a narrowed read-only command allowlist. `/goal complete --force` requires launch-time `CLAUDE_GOAL_FORCE_OK=1`.
+- `self` — skips the subprocess and trusts the worker's own completion claim. This is the pre-audit codex-default behavior (the worker marks itself complete after the seven-bullet audit). Logs a `self_audit` event. Requires launch-time `CLAUDE_GOAL_FORCE_OK=1`.
+- `off` — no audit at all. Legacy alias for approved `CLAUDE_GOAL_AUDIT_DISABLE=1`. Logs `force_complete`. Requires launch-time `CLAUDE_GOAL_FORCE_OK=1`.
 
 ### Env-var overrides
 
@@ -102,7 +105,7 @@ Env vars take precedence over the config file for the current session.
 | `CLAUDE_GOAL_AUDIT_MODE` | `audit.mode` | `adversarial` | One of `adversarial`, `self`, `off`. |
 | `CLAUDE_GOAL_AUDIT_MODEL` | `audit.model` | `sonnet` | Model id passed to `claude -p --model`. |
 | `CLAUDE_GOAL_AUDIT_TIMEOUT` | `audit.timeout` | `180` | Seconds before the auditor is killed and treated as `error`. |
-| `CLAUDE_GOAL_AUDIT_DISABLE` | — | unset | `1` is a legacy alias for `audit.mode = off`. |
+| `CLAUDE_GOAL_AUDIT_DISABLE` | — | unset | `1` is a legacy alias for `audit.mode = off`; requires launch-time `CLAUDE_GOAL_FORCE_OK=1`. |
 
 ### `/goal config` subcommand
 
@@ -111,14 +114,14 @@ Inspect and edit the config file without hand-editing TOML:
 ```text
 /goal config list
 /goal config get audit.mode
-/goal config set audit.mode self
+/goal config set audit.mode self  # requires launch-time CLAUDE_GOAL_FORCE_OK=1
 ```
 
 ## Notes
 
 Claude Code custom skills do not currently expose reliable live per-turn token usage to markdown commands, so budgets are soft — use `add-tokens` to account manually (or drive it from a hook). Elapsed-time tracking is local and persistent.
 
-The Stop hook blocks Claude from stopping while the current goal is `active` or `pending_audit`. It stops blocking when you run `/goal pause`, `/goal clear`, or `/goal complete` (with a passing audit or `--force`).
+The Stop hook blocks Claude from stopping while the current goal is `active` or `pending_audit`. It stops blocking when you run `/goal pause`, `/goal clear`, or `/goal complete` (with a passing audit or approved `--force`), or when the runaway guard auto-pauses the goal.
 
 ### Parallel sessions
 
@@ -128,7 +131,7 @@ The skill is designed to work across many concurrent Claude Code sessions:
 - The Stop hook stats a marker file at `$CLAUDE_GOAL_HOME/.active` before touching SQLite — sessions without any active goal pay one syscall per turn, not a DB open.
 - The `events` table carries a composite index on `(goal_id, event, created_at)` so the runaway-guard query stays fast under heavy use. Events older than 30 days are GC'd on every `/goal clear` and successful `/goal complete`.
 
-By default, the runaway guard allows up to 500 Stop-hook continuations for a single active goal. That high default is intentional: `/goal` is meant for long-running work where Claude may need many turns to finish. If you want a stricter cap, set `CLAUDE_GOAL_MAX_STOP_CONTINUES` before launching Claude Code:
+By default, the runaway guard allows up to 500 Stop-hook continuations for a single active goal. When the cap is reached, the hook pauses the goal and asks Claude to summarize before stopping. That high default is intentional: `/goal` is meant for long-running work where Claude may need many turns to finish. If you want a stricter cap, set `CLAUDE_GOAL_MAX_STOP_CONTINUES` before launching Claude Code:
 
 ```bash
 export CLAUDE_GOAL_MAX_STOP_CONTINUES=50

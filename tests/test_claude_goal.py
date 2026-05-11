@@ -22,6 +22,7 @@ def run_goal(tmp_path, *args, session="test-session", extra_env=None):
     # Each test gets its own config.toml so /goal config tests don't stomp on
     # the user's real config and config-less tests get clean defaults.
     env["CLAUDE_GOAL_CONFIG"] = str(tmp_path / "config.toml")
+    env["CLAUDE_GOAL_TESTING"] = "1"
     env.setdefault("CLAUDE_GOAL_AUDIT_FAKE", DEFAULT_FAKE_AUDIT)
     if extra_env:
         env.update(extra_env)
@@ -69,6 +70,12 @@ def test_rejects_empty_and_duplicate_without_replace(tmp_path):
     result = run_goal(tmp_path, "set", "second objective")
     assert result.returncode == 1
     assert "already has a goal" in result.stderr
+
+
+def test_objective_with_apostrophe_is_not_shell_parsed(tmp_path):
+    result = run_goal(tmp_path, "invoke", "fix Bob's auth tests")
+    assert result.returncode == 0, result.stderr
+    assert "fix Bob's auth tests" in result.stdout
 
 
 def test_set_same_objective_is_idempotent(tmp_path):
@@ -312,6 +319,29 @@ def test_stop_hook_blocks_active_goal(tmp_path):
     assert "Do not accept proxy signals as completion" in data["reason"]
 
 
+def test_stop_hook_max_continues_pauses_goal_with_block_reason(tmp_path):
+    assert run_goal(tmp_path, "set", "keep going").returncode == 0
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
+    env["CLAUDE_GOAL_SESSION_ID"] = "test-session"
+    env["CLAUDE_GOAL_MAX_STOP_CONTINUES"] = "0"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "stop-hook"],
+        input=json.dumps({"session_id": "test-session"}),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["decision"] == "block"
+    assert "auto-continuation paused" in data["reason"]
+
+    status = run_goal(tmp_path, "status")
+    assert "Status: paused" in status.stdout
+
+
 def test_stop_hook_allows_paused_goal(tmp_path):
     assert run_goal(tmp_path, "set", "keep going").returncode == 0
     assert run_goal(tmp_path, "pause").returncode == 0
@@ -425,6 +455,44 @@ def test_term_session_anchors_goal_across_pwd_drift(tmp_path):
     assert status_result.returncode == 0, status_result.stderr
     assert "stay alive across drift" in status_result.stdout
     assert "Status: active" in status_result.stdout
+
+
+def test_cwd_fallback_does_not_create_duplicate_open_goals(tmp_path):
+    """Without a stable session id, a second /goal should find the lone open goal."""
+    db = str(tmp_path / "goals.sqlite")
+    base = os.environ.copy()
+    base["CLAUDE_GOAL_DB"] = db
+    base["CLAUDE_GOAL_CONFIG"] = str(tmp_path / "config.toml")
+    base.pop("CLAUDE_GOAL_SESSION_ID", None)
+    base.pop("CLAUDE_SESSION_ID", None)
+    base.pop("TERM_SESSION_ID", None)
+
+    env_a = base.copy()
+    env_a["PWD"] = "/tmp/original-cwd"
+    first = subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "first goal"],
+        env=env_a, text=True, capture_output=True, check=False,
+    )
+    assert first.returncode == 0, first.stderr
+
+    env_b = base.copy()
+    env_b["PWD"] = "/tmp/drifted-cwd"
+    second = subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "second goal"],
+        env=env_b, text=True, capture_output=True, check=False,
+    )
+    assert second.returncode == 1
+    assert "already has a goal" in second.stderr
+
+    import sqlite3
+    conn = sqlite3.connect(db)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM goals WHERE status IN ('active', 'paused', 'budget_limited', 'pending_audit')"
+        ).fetchone()[0]
+        assert count == 1
+    finally:
+        conn.close()
 
 
 def test_stop_hook_finds_goal_via_hook_payload_cwd(tmp_path):
@@ -586,9 +654,10 @@ def test_audit_error_keeps_pending_audit(tmp_path):
 def test_force_complete_skips_audit_and_logs(tmp_path):
     assert run_goal(tmp_path, "set", "ship").returncode == 0
     # Even with a fake FAIL set, --force must bypass and mark complete —
-    # but only when the user has explicitly set CLAUDE_GOAL_FORCE_OK=1.
+    # but only when launch-time approval is present.
     result = run_goal(tmp_path, "complete", "--force", extra_env={
         "CLAUDE_GOAL_FORCE_OK": "1",
+        "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1",
         "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
             "verdict": "fail",
             "missing": ["not really done"],
@@ -606,10 +675,8 @@ def test_force_complete_skips_audit_and_logs(tmp_path):
 def test_force_complete_rejected_without_env_var(tmp_path):
     """Without CLAUDE_GOAL_FORCE_OK=1, --force must refuse to bypass the audit.
 
-    This is the guardrail: a drifting worker cannot rationalize
-    `/goal complete --force` on its own, because Claude Code's Bash tool
-    doesn't inherit arbitrary env vars — only the user who launched the
-    Claude Code session can set this.
+    This is the guardrail against accidental one-command bypasses. It is not
+    a hard security boundary because plugins run in the user's shell context.
     """
     assert run_goal(tmp_path, "set", "ship").returncode == 0
     # Note: run_goal defaults set CLAUDE_GOAL_AUDIT_FAKE but NOT FORCE_OK.
@@ -624,9 +691,21 @@ def test_force_complete_rejected_without_env_var(tmp_path):
     assert "force_complete" not in events
 
 
+def test_force_complete_rejected_with_one_command_env_only(tmp_path):
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    result = run_goal(tmp_path, "complete", "--force",
+                      extra_env={"CLAUDE_GOAL_FORCE_OK": "1"})
+    assert result.returncode == 1
+    assert "one-command environment overrides are ignored" in result.stderr
+    status = run_goal(tmp_path, "status")
+    assert "Status: active" in status.stdout
+
+
 def test_audit_disable_env_skips_audit(tmp_path):
     assert run_goal(tmp_path, "set", "ship").returncode == 0
     result = run_goal(tmp_path, "complete", extra_env={
+        "CLAUDE_GOAL_FORCE_OK": "1",
+        "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1",
         "CLAUDE_GOAL_AUDIT_DISABLE": "1",
         # Fake audit would fail, but disable flag must short-circuit.
         "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "fail", "missing": ["x"]}),
@@ -642,6 +721,7 @@ def test_force_via_invoke_also_bypasses_audit(tmp_path):
     assert run_goal(tmp_path, "set", "ship").returncode == 0
     result = run_goal(tmp_path, "invoke", "complete --force", extra_env={
         "CLAUDE_GOAL_FORCE_OK": "1",
+        "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1",
         "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({"verdict": "fail", "missing": ["x"]}),
     })
     assert result.returncode == 0, result.stderr
@@ -806,6 +886,22 @@ def test_session_start_hook_writes_env_file(tmp_path):
     assert "hook-provided-sid" in body
 
 
+def test_session_start_hook_records_force_launch_approval(tmp_path):
+    env_file = tmp_path / "env"
+    env_file.write_text("")
+    env = os.environ.copy()
+    env["CLAUDE_ENV_FILE"] = str(env_file)
+    env["CLAUDE_GOAL_FORCE_OK"] = "1"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "session-start-hook"],
+        input=json.dumps({"session_id": "hook-provided-sid"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    body = env_file.read_text()
+    assert "CLAUDE_GOAL_FORCE_LAUNCH_OK=1" in body
+
+
 def test_session_start_hook_noop_without_env_file(tmp_path):
     """If CLAUDE_ENV_FILE is unset, the hook silently exits 0 without touching anything."""
     env = os.environ.copy()
@@ -847,7 +943,10 @@ def test_marker_file_present_during_pending_audit(tmp_path):
 
     # Force-complete: marker should vanish.
     assert run_goal(tmp_path, "complete", "--force",
-                    extra_env={"CLAUDE_GOAL_FORCE_OK": "1"}).returncode == 0
+                    extra_env={
+                        "CLAUDE_GOAL_FORCE_OK": "1",
+                        "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1",
+                    }).returncode == 0
     assert not _marker_path(tmp_path).exists()
 
 
@@ -929,6 +1028,7 @@ def test_parallel_sessions_stay_isolated(tmp_path):
         env.pop("CLAUDE_GOAL_SESSION_ID", None)
         env.pop("TERM_SESSION_ID", None)
         env["CLAUDE_SESSION_ID"] = sid
+        env["CLAUDE_GOAL_TESTING"] = "1"
         env["CLAUDE_GOAL_AUDIT_FAKE"] = DEFAULT_FAKE_AUDIT
         return env
 
@@ -996,14 +1096,14 @@ def test_config_defaults_without_file(tmp_path):
 
 def test_config_set_persists_and_round_trips(tmp_path):
     """`config set` writes TOML; subsequent `config get` reads it back."""
-    set_result = run_goal(tmp_path, "config", "set", "audit.mode", "self")
+    set_result = run_goal(tmp_path, "config", "set", "audit.model", "opus")
     assert set_result.returncode == 0, set_result.stderr
-    assert "audit.mode = self" in set_result.stdout
+    assert "audit.model = opus" in set_result.stdout
     assert _config_path(tmp_path).exists()
 
-    get_result = run_goal(tmp_path, "config", "get", "audit.mode")
+    get_result = run_goal(tmp_path, "config", "get", "audit.model")
     assert get_result.returncode == 0, get_result.stderr
-    assert get_result.stdout.strip() == "audit.mode = self"
+    assert get_result.stdout.strip() == "audit.model = opus"
 
 
 def test_config_rejects_invalid_enum(tmp_path):
@@ -1014,19 +1114,33 @@ def test_config_rejects_invalid_enum(tmp_path):
 
 
 def test_config_env_overrides_toml(tmp_path):
-    """CLAUDE_GOAL_AUDIT_MODE env trumps the value in config.toml."""
-    assert run_goal(tmp_path, "config", "set", "audit.mode", "self").returncode == 0
+    """CLAUDE_GOAL_AUDIT_MODEL env trumps the value in config.toml."""
+    assert run_goal(tmp_path, "config", "set", "audit.model", "opus").returncode == 0
     result = run_goal(tmp_path, "config", "list",
-                      extra_env={"CLAUDE_GOAL_AUDIT_MODE": "adversarial"})
-    assert "audit.mode = adversarial" in result.stdout
+                      extra_env={"CLAUDE_GOAL_AUDIT_MODEL": "sonnet"})
+    assert "audit.model = sonnet" in result.stdout
 
 
 def test_legacy_audit_disable_maps_to_off(tmp_path):
     """CLAUDE_GOAL_AUDIT_DISABLE=1 still maps to mode=off for back-compat."""
     # Don't set CLAUDE_GOAL_AUDIT_MODE so the legacy alias kicks in.
     result = run_goal(tmp_path, "config", "list",
-                      extra_env={"CLAUDE_GOAL_AUDIT_DISABLE": "1"})
+                      extra_env={
+                          "CLAUDE_GOAL_FORCE_OK": "1",
+                          "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1",
+                          "CLAUDE_GOAL_AUDIT_DISABLE": "1",
+                      })
     assert "audit.mode = off" in result.stdout
+
+
+def test_unsafe_audit_mode_requires_launch_approval(tmp_path):
+    result = run_goal(tmp_path, "config", "set", "audit.mode", "off")
+    assert result.returncode == 1
+    assert "weakens the adversarial audit" in result.stderr
+
+    result = run_goal(tmp_path, "config", "list",
+                      extra_env={"CLAUDE_GOAL_AUDIT_DISABLE": "1"})
+    assert "audit.mode = adversarial" in result.stdout
 
 
 def test_self_mode_skips_subprocess(tmp_path):
@@ -1036,11 +1150,13 @@ def test_self_mode_skips_subprocess(tmp_path):
     mode had run, the goal would revert to active. In self mode it shouldn't
     even look at the fake — goes straight to complete.
     """
-    assert run_goal(tmp_path, "config", "set", "audit.mode", "self").returncode == 0
+    approved = {"CLAUDE_GOAL_FORCE_OK": "1", "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1"}
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "self",
+                    extra_env=approved).returncode == 0
     assert run_goal(tmp_path, "set", "ship").returncode == 0
 
     result = run_goal(tmp_path, "complete",
-                      extra_env={"CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
+                      extra_env={**approved, "CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
                           "verdict": "fail",
                           "missing": ["auditor would have failed"],
                       })})
@@ -1058,10 +1174,12 @@ def test_self_mode_skips_subprocess(tmp_path):
 
 def test_off_mode_preserves_legacy_behavior(tmp_path):
     """off mode: /goal complete marks complete, logs force_complete, no audit."""
-    assert run_goal(tmp_path, "config", "set", "audit.mode", "off").returncode == 0
+    approved = {"CLAUDE_GOAL_FORCE_OK": "1", "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1"}
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "off",
+                    extra_env=approved).returncode == 0
     assert run_goal(tmp_path, "set", "ship").returncode == 0
 
-    result = run_goal(tmp_path, "complete")
+    result = run_goal(tmp_path, "complete", extra_env=approved)
     assert result.returncode == 0, result.stderr
     assert "Status: complete" in result.stdout
     assert "Audit:" not in result.stdout
@@ -1072,20 +1190,23 @@ def test_off_mode_preserves_legacy_behavior(tmp_path):
 
 
 def test_force_in_self_mode_is_noop(tmp_path):
-    """--force in self mode must not error and not require CLAUDE_GOAL_FORCE_OK."""
-    assert run_goal(tmp_path, "config", "set", "audit.mode", "self").returncode == 0
+    """--force in self mode must not run the adversarial auditor."""
+    approved = {"CLAUDE_GOAL_FORCE_OK": "1", "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1"}
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "self",
+                    extra_env=approved).returncode == 0
     assert run_goal(tmp_path, "set", "ship").returncode == 0
-    # No CLAUDE_GOAL_FORCE_OK in env.
-    result = run_goal(tmp_path, "complete", "--force")
+    result = run_goal(tmp_path, "complete", "--force", extra_env=approved)
     assert result.returncode == 0, result.stderr
     assert "Status: complete" in result.stdout
 
 
 def test_force_in_off_mode_is_noop(tmp_path):
-    """--force in off mode must not error and not require CLAUDE_GOAL_FORCE_OK."""
-    assert run_goal(tmp_path, "config", "set", "audit.mode", "off").returncode == 0
+    """--force in off mode must not run the adversarial auditor."""
+    approved = {"CLAUDE_GOAL_FORCE_OK": "1", "CLAUDE_GOAL_FORCE_LAUNCH_OK": "1"}
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "off",
+                    extra_env=approved).returncode == 0
     assert run_goal(tmp_path, "set", "ship").returncode == 0
-    result = run_goal(tmp_path, "complete", "--force")
+    result = run_goal(tmp_path, "complete", "--force", extra_env=approved)
     assert result.returncode == 0, result.stderr
     assert "Status: complete" in result.stdout
 
@@ -1128,6 +1249,3 @@ def test_config_timeout_validation(tmp_path):
     valid = run_goal(tmp_path, "config", "set", "audit.timeout", "60")
     assert valid.returncode == 0, valid.stderr
     assert "audit.timeout = 60" in valid.stdout
-
-
-

@@ -1,0 +1,246 @@
+name: Release
+
+# Fires only after CI succeeds on main/master. workflow_run is how you chain
+# workflows conditionally; using plain `on: push` + status checks would
+# double-run for every push.
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main, master]
+    types: [completed]
+
+# Protect against two Release runs racing if two pushes land close
+# together. The second one would see the first's bump + tag and get
+# confused.
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to push the bump commit + tag + create release
+
+jobs:
+  release:
+    name: Bump version, tag, release, sync marketplace
+    runs-on: ubuntu-latest
+    # Only proceed if CI passed for a direct push to main/master.
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          # We need full history to know what commits went into this release
+          # (for release notes) and to push a commit back.
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch }}
+          # Use GITHUB_TOKEN so the push commit below has provenance.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether this CI run should release
+        id: check
+        run: |
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          TRIGGER_SHA="${{ github.event.workflow_run.head_sha }}"
+          CURRENT_SHA="$(git rev-parse "origin/${BRANCH}")"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT_SHA" != "$TRIGGER_SHA" ]; then
+            echo "Skipping: CI succeeded for ${TRIGGER_SHA}, but origin/${BRANCH} is now ${CURRENT_SHA}."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HEAD_MSG=$(git log -1 --pretty=%B)
+          if echo "$HEAD_MSG" | grep -qE '^chore\(release\):'; then
+            echo "Skipping: HEAD is a release-bot commit."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump patch version in plugin.json
+        if: steps.check.outputs.skip != 'true'
+        id: bump
+        run: |
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(".claude-plugin/plugin.json")
+          manifest = json.loads(path.read_text())
+          old = manifest["version"]
+          major, minor, patch = (int(p) for p in old.split("."))
+          new = f"{major}.{minor}.{patch + 1}"
+          manifest["version"] = new
+          path.write_text(json.dumps(manifest, indent=2) + "\n")
+          print(f"old_version={old}")
+          print(f"new_version={new}")
+
+          # Export as GitHub Actions outputs.
+          import os
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"old_version={old}\n")
+              fh.write(f"new_version={new}\n")
+          PY
+
+      - name: Prepend CHANGELOG entry
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          python3 <<'PY'
+          import os
+          import subprocess
+          from datetime import date
+          from pathlib import Path
+
+          new_version = os.environ["NEW_VERSION"]
+          old_version = os.environ["OLD_VERSION"]
+          today = date.today().isoformat()
+
+          # Gather commits since the last release tag, if any.
+          try:
+              last_tag = subprocess.check_output(
+                  ["git", "describe", "--tags", "--abbrev=0"],
+                  text=True, stderr=subprocess.DEVNULL,
+              ).strip()
+              range_spec = f"{last_tag}..HEAD"
+          except subprocess.CalledProcessError:
+              range_spec = "HEAD"
+
+          log = subprocess.check_output(
+              ["git", "log", "--pretty=format:- %s (%h)", range_spec],
+              text=True,
+          ).strip()
+          if not log:
+              log = "- Release bump (no user-facing commits since last release)"
+
+          body = f"""## [{new_version}] - {today}
+
+          {log}
+
+          """
+          # Dedent to column 0 since the heredoc above has 10-space indentation.
+          body = "\n".join(line[10:] if line.startswith(" " * 10) else line
+                           for line in body.splitlines()) + "\n"
+
+          changelog_path = Path("CHANGELOG.md")
+          if changelog_path.exists():
+              existing = changelog_path.read_text()
+              # Keep any existing top matter (# Changelog heading, etc.) above
+              # the first release entry.
+              lines = existing.splitlines(keepends=True)
+              split_at = next((i for i, ln in enumerate(lines) if ln.startswith("## [")), len(lines))
+              head = "".join(lines[:split_at])
+              tail = "".join(lines[split_at:])
+              new_contents = head + body + tail
+          else:
+              new_contents = "# Changelog\n\n" + body
+          changelog_path.write_text(new_contents)
+          PY
+        env:
+          OLD_VERSION: ${{ steps.bump.outputs.old_version }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+
+      - name: Commit bump + push
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git add .claude-plugin/plugin.json CHANGELOG.md
+          if git diff --staged --quiet; then
+            echo "No staged changes — already at the target version. Exiting."
+            exit 0
+          fi
+          # [skip ci] keeps the release bump from kicking off another CI run.
+          git commit -m "chore(release): v${{ steps.bump.outputs.new_version }} [skip ci]
+
+          Automated version bump and changelog entry from release.yml."
+          git push origin HEAD:${{ steps.check.outputs.branch }}
+
+      - name: Create and push tag
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          TAG="v${{ steps.bump.outputs.new_version }}"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Extract release notes from CHANGELOG
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          target = os.environ["NEW_VERSION"]
+          text = Path("CHANGELOG.md").read_text().splitlines()
+          start = None
+          for i, line in enumerate(text):
+              if line.startswith(f"## [{target}]"):
+                  start = i + 1
+                  break
+          if start is None:
+              body = f"Release v{target}."
+          else:
+              end = len(text)
+              for j in range(start, len(text)):
+                  if text[j].startswith("## ["):
+                      end = j
+                      break
+              body = "\n".join(text[start:end]).strip()
+          Path("RELEASE_NOTES.md").write_text(body + "\n")
+          PY
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.bump.outputs.new_version }}" \
+            --title "v${{ steps.bump.outputs.new_version }}" \
+            --notes-file RELEASE_NOTES.md
+
+      - name: Sync marketplace repo (best-effort)
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          if [ -z "${{ secrets.MARKETPLACE_DEPLOY_KEY }}" ]; then
+            echo "::warning::MARKETPLACE_DEPLOY_KEY not set; skipping marketplace sync."
+            echo "Add a deploy key to balakumardev/claude and store the private half as this repo's MARKETPLACE_DEPLOY_KEY secret."
+            exit 0
+          fi
+
+          # Set up SSH with the deploy key.
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MARKETPLACE_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone git@github.com:balakumardev/claude.git marketplace-repo
+          cd marketplace-repo
+
+          python3 <<PY
+          import json
+          from pathlib import Path
+          path = Path(".claude-plugin/marketplace.json")
+          data = json.loads(path.read_text())
+          for entry in data.get("plugins", []):
+              if entry.get("name") == "claude-code-goal":
+                  entry["version"] = "${{ steps.bump.outputs.new_version }}"
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .claude-plugin/marketplace.json
+          if git diff --staged --quiet; then
+            echo "Marketplace entry already at v${{ steps.bump.outputs.new_version }}; nothing to push."
+            exit 0
+          fi
+          git commit -m "chore: bump claude-code-goal to v${{ steps.bump.outputs.new_version }}"
+          git push origin main
