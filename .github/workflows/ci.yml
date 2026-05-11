@@ -42,5 +42,8 @@ jobs:
       - name: Validate plugin manifest
         run: claude plugin validate .
 
+      - name: Install test dependencies
+        run: python3 -m pip install pytest
+
       - name: Run test suite
         run: python3 -m pytest tests -v
