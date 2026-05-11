@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "claude-code-goal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Persistent /goal command for Claude Code. Holds a long-running objective across turns, auto-continues via a Stop hook, and gates completion behind a configurable audit (default: an adversarial second Claude session that proves the objective was met).",
   "author": {
     "name": "Bala Kumar",
@@ -18,7 +18,9 @@
     "long-running",
     "codex"
   ],
-  "skills": ["./goal"],
+  "skills": [
+    "./goal"
+  ],
   "hooks": {
     "Stop": [
       {

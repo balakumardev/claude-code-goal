@@ -5,6 +5,21 @@ is based on [Keep a Changelog](https://keepachangelog.com/) and this
 project adheres to [Semantic Versioning](https://semver.org/) patch bumps
 on every commit and minor/major bumps when explicitly triggered.
 
+## [0.1.1] - 2026-05-11
+
+- Install pytest in CI (a6f1ccd)
+- Fix goal plugin audit and release automation (02b451f)
+- Keep SUBMISSION.md local-only (Anthropic directory draft) (8d24d07)
+- Fix skills path in plugin manifest: ./ -> ./goal (446e7ec)
+- Convert to Claude Code plugin (545502e)
+- Configurable audit mode: adversarial / self / off + /goal config (4edf1f1)
+- Fix auditor argv, robust JSON parsing, and gate --force behind user env var (cac2b0a)
+- Harden for parallel Claude Code sessions (07645fe)
+- Add adversarial audit gate on /goal complete (27769e6)
+- SKILL.md: action-first, prevent Claude from entering plan mode on /goal (cc793ab)
+- Rename to claude-code-goal (878363a)
+- Initial commit (6575c6a)
+
 ## [0.1.0] - 2026-05-11
 
 Initial public release as a Claude Code plugin.
