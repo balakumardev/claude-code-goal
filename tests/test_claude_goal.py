@@ -19,6 +19,9 @@ def run_goal(tmp_path, *args, session="test-session", extra_env=None):
     env = os.environ.copy()
     env["CLAUDE_GOAL_DB"] = str(tmp_path / "goals.sqlite")
     env["CLAUDE_GOAL_SESSION_ID"] = session
+    # Each test gets its own config.toml so /goal config tests don't stomp on
+    # the user's real config and config-less tests get clean defaults.
+    env["CLAUDE_GOAL_CONFIG"] = str(tmp_path / "config.toml")
     env.setdefault("CLAUDE_GOAL_AUDIT_FAKE", DEFAULT_FAKE_AUDIT)
     if extra_env:
         env.update(extra_env)
@@ -971,5 +974,160 @@ def test_parallel_sessions_stay_isolated(tmp_path):
         env=env_for("bravo"), text=True, capture_output=True, check=False,
     )
     assert "Status: active" in status_b2.stdout
+
+
+# ---------------------------------------------------------------------------
+# Audit mode configuration: adversarial / self / off + /goal config.
+# ---------------------------------------------------------------------------
+
+
+def _config_path(tmp_path):
+    return tmp_path / "config.toml"
+
+
+def test_config_defaults_without_file(tmp_path):
+    """With no TOML and no env, the effective config is all defaults."""
+    result = run_goal(tmp_path, "config", "list")
+    assert result.returncode == 0, result.stderr
+    assert "audit.mode = adversarial" in result.stdout
+    assert "audit.model = sonnet" in result.stdout
+    assert "audit.timeout = 180" in result.stdout
+
+
+def test_config_set_persists_and_round_trips(tmp_path):
+    """`config set` writes TOML; subsequent `config get` reads it back."""
+    set_result = run_goal(tmp_path, "config", "set", "audit.mode", "self")
+    assert set_result.returncode == 0, set_result.stderr
+    assert "audit.mode = self" in set_result.stdout
+    assert _config_path(tmp_path).exists()
+
+    get_result = run_goal(tmp_path, "config", "get", "audit.mode")
+    assert get_result.returncode == 0, get_result.stderr
+    assert get_result.stdout.strip() == "audit.mode = self"
+
+
+def test_config_rejects_invalid_enum(tmp_path):
+    """Invalid audit.mode value must be rejected with a clear error."""
+    result = run_goal(tmp_path, "config", "set", "audit.mode", "bogus")
+    assert result.returncode == 1
+    assert "audit.mode must be one of" in result.stderr
+
+
+def test_config_env_overrides_toml(tmp_path):
+    """CLAUDE_GOAL_AUDIT_MODE env trumps the value in config.toml."""
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "self").returncode == 0
+    result = run_goal(tmp_path, "config", "list",
+                      extra_env={"CLAUDE_GOAL_AUDIT_MODE": "adversarial"})
+    assert "audit.mode = adversarial" in result.stdout
+
+
+def test_legacy_audit_disable_maps_to_off(tmp_path):
+    """CLAUDE_GOAL_AUDIT_DISABLE=1 still maps to mode=off for back-compat."""
+    # Don't set CLAUDE_GOAL_AUDIT_MODE so the legacy alias kicks in.
+    result = run_goal(tmp_path, "config", "list",
+                      extra_env={"CLAUDE_GOAL_AUDIT_DISABLE": "1"})
+    assert "audit.mode = off" in result.stdout
+
+
+def test_self_mode_skips_subprocess(tmp_path):
+    """In self mode, /goal complete marks complete without running any auditor.
+
+    Prove by setting CLAUDE_GOAL_AUDIT_FAKE to a FAIL verdict: if adversarial
+    mode had run, the goal would revert to active. In self mode it shouldn't
+    even look at the fake — goes straight to complete.
+    """
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "self").returncode == 0
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+
+    result = run_goal(tmp_path, "complete",
+                      extra_env={"CLAUDE_GOAL_AUDIT_FAKE": json.dumps({
+                          "verdict": "fail",
+                          "missing": ["auditor would have failed"],
+                      })})
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+    # Audit summary must not appear because no audit ran.
+    assert "Audit:" not in result.stdout
+
+    events = _events(tmp_path)
+    assert "self_audit" in events
+    assert "audit_start" not in events
+    assert "audit_pass" not in events
+    assert "audit_fail" not in events
+
+
+def test_off_mode_preserves_legacy_behavior(tmp_path):
+    """off mode: /goal complete marks complete, logs force_complete, no audit."""
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "off").returncode == 0
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+
+    result = run_goal(tmp_path, "complete")
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+    assert "Audit:" not in result.stdout
+
+    events = _events(tmp_path)
+    assert "force_complete" in events
+    assert "audit_start" not in events
+
+
+def test_force_in_self_mode_is_noop(tmp_path):
+    """--force in self mode must not error and not require CLAUDE_GOAL_FORCE_OK."""
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "self").returncode == 0
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # No CLAUDE_GOAL_FORCE_OK in env.
+    result = run_goal(tmp_path, "complete", "--force")
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+
+
+def test_force_in_off_mode_is_noop(tmp_path):
+    """--force in off mode must not error and not require CLAUDE_GOAL_FORCE_OK."""
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "off").returncode == 0
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    result = run_goal(tmp_path, "complete", "--force")
+    assert result.returncode == 0, result.stderr
+    assert "Status: complete" in result.stdout
+
+
+def test_adversarial_mode_still_runs_audit(tmp_path):
+    """Even with config.toml explicitly setting adversarial, the full audit runs."""
+    assert run_goal(tmp_path, "config", "set", "audit.mode", "adversarial").returncode == 0
+    assert run_goal(tmp_path, "set", "ship").returncode == 0
+    # Fake audit PASS (so the test stays offline).
+    result = run_goal(tmp_path, "complete")
+    assert result.returncode == 0, result.stderr
+    assert "Audit: PASS" in result.stdout
+    events = _events(tmp_path)
+    assert "audit_start" in events
+    assert "audit_pass" in events
+
+
+def test_config_get_unknown_key_errors(tmp_path):
+    """Asking for a key that doesn't exist returns a clear error."""
+    result = run_goal(tmp_path, "config", "get", "audit.nonexistent")
+    assert result.returncode == 1
+    assert "unknown config key" in result.stderr
+
+
+def test_config_invoke_slash_path_works(tmp_path):
+    """`/goal config list` via invoke (skill path) returns the same as CLI."""
+    result = run_goal(tmp_path, "invoke", "config list")
+    assert result.returncode == 0, result.stderr
+    assert "audit.mode = adversarial" in result.stdout
+
+
+def test_config_timeout_validation(tmp_path):
+    """audit.timeout must be a positive integer."""
+    neg = run_goal(tmp_path, "config", "set", "audit.timeout", "-5")
+    assert neg.returncode == 1
+    zero = run_goal(tmp_path, "config", "set", "audit.timeout", "0")
+    assert zero.returncode == 1
+    non_int = run_goal(tmp_path, "config", "set", "audit.timeout", "hello")
+    assert non_int.returncode == 1
+    valid = run_goal(tmp_path, "config", "set", "audit.timeout", "60")
+    assert valid.returncode == 0, valid.stderr
+    assert "audit.timeout = 60" in valid.stdout
+
 
 

@@ -53,6 +53,8 @@ The clone strengthens one guarantee that Codex leaves loose: **who decides a goa
 - Override for false-FAIL: `/goal complete --force` (logged as `force_complete` in events) or `CLAUDE_GOAL_AUDIT_DISABLE=1` (blanket off for the session). Tunables: `CLAUDE_GOAL_AUDIT_MODEL` (default `sonnet`), `CLAUDE_GOAL_AUDIT_TIMEOUT` (default 180s).
 - New status `pending_audit` (label `audit pending`) sits between `active` and `complete` during the audit window. Stop hook blocks during `pending_audit` too, so the worker session can't end while the audit is running.
 
+Users can opt out of adversarial auditing via `audit.mode = self` in `~/.claude/goal/config.toml`, which restores codex-default behavior (worker marks itself complete after the 7-bullet audit). The adversarial mode is opt-in-by-default because that's the hole this clone was built to close, but the option exists for users who want codex parity.
+
 ## Clone extensions not present in Codex
 
 These are additions that made sense for the Claude Code integration but do not exist in Codex:

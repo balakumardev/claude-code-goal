@@ -51,6 +51,8 @@ python3 ~/.claude/skills/goal/scripts/claude_goal.py add-tokens <N>
 
 ## Completion audit
 
+Runs by default on every `/goal complete`. You can switch to `self` mode (codex-default: worker marks itself complete) or `off` mode via `/goal config set audit.mode <value>`.
+
 `/goal complete` does not mark the goal done on its own. Instead it moves the goal to `pending_audit` and spawns an **adversarial audit** in a separate `claude -p` process with a hostile system prompt ("prove the worker wrong"), read-only tools (no Edit / Write), no shared session, and no access to the worker's reasoning. The auditor can only see the objective text and the repository on disk.
 
 Three outcomes:
@@ -81,7 +83,45 @@ Tune the auditor via environment variables:
 |---|---|---|
 | `CLAUDE_GOAL_AUDIT_MODEL` | `sonnet` | Model id passed to `claude -p --model`. |
 | `CLAUDE_GOAL_AUDIT_TIMEOUT` | `180` | Seconds before the auditor is killed and treated as `error`. |
-| `CLAUDE_GOAL_AUDIT_DISABLE` | unset | `1` skips the auditor entirely (equivalent to always-`--force`). |
+| `CLAUDE_GOAL_AUDIT_DISABLE` | unset | `1` skips the auditor entirely (legacy alias for `audit.mode = off`). |
+
+## Configuration
+
+Persistent configuration lives at `~/.claude/goal/config.toml` (override the directory with `CLAUDE_GOAL_HOME`, or point at a different file with `CLAUDE_GOAL_CONFIG`). Example:
+
+```toml
+[audit]
+mode = "adversarial"
+model = "sonnet"
+timeout = 180
+```
+
+### Audit modes
+
+- `adversarial` (default) — spawns `claude -p` as a separate session to verify the objective was met. Hostile system prompt, read-only tools, independent session. `/goal complete --force` still requires `CLAUDE_GOAL_FORCE_OK=1` in the shell that launched Claude Code.
+- `self` — skips the subprocess and trusts the worker's own completion claim. This is the pre-audit codex-default behavior (the worker marks itself complete after the seven-bullet audit). Logs a `self_audit` event. `--force` is a no-op here because there is nothing to force past.
+- `off` — no audit at all. Legacy alias for `CLAUDE_GOAL_AUDIT_DISABLE=1`. Logs `force_complete`.
+
+### Env-var overrides
+
+Env vars take precedence over the config file for the current session.
+
+| Variable | Config key | Default | Purpose |
+|---|---|---|---|
+| `CLAUDE_GOAL_AUDIT_MODE` | `audit.mode` | `adversarial` | One of `adversarial`, `self`, `off`. |
+| `CLAUDE_GOAL_AUDIT_MODEL` | `audit.model` | `sonnet` | Model id passed to `claude -p --model`. |
+| `CLAUDE_GOAL_AUDIT_TIMEOUT` | `audit.timeout` | `180` | Seconds before the auditor is killed and treated as `error`. |
+| `CLAUDE_GOAL_AUDIT_DISABLE` | — | unset | `1` is a legacy alias for `audit.mode = off`. |
+
+### `/goal config` subcommand
+
+Inspect and edit the config file without hand-editing TOML:
+
+```text
+/goal config list
+/goal config get audit.mode
+/goal config set audit.mode self
+```
 
 ## Notes
 

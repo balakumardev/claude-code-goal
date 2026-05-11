@@ -41,8 +41,18 @@ DB_PATH = Path(os.environ.get("CLAUDE_GOAL_DB", STATE_DIR / "goals.sqlite"))
 # DB so tests overriding CLAUDE_GOAL_DB get isolated markers for free; the
 # explicit CLAUDE_GOAL_MARKER override is still honored.
 MARKER_PATH = Path(os.environ.get("CLAUDE_GOAL_MARKER", DB_PATH.parent / ".active"))
+# Config file: TOML document controlling audit mode / model / timeout and
+# anything else knob-ish. Env vars override the on-disk values (single-session
+# overrides without editing the file).
+CONFIG_PATH = Path(os.environ.get("CLAUDE_GOAL_CONFIG", STATE_DIR / "config.toml"))
 # Events older than this are GC'd on goal clear/complete.
 EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
+# Valid values for audit.mode. "adversarial" runs the separate `claude -p`
+# subprocess auditor; "self" trusts the worker's self-assessment (codex-style);
+# "off" marks complete immediately with no audit or self-check (preserves the
+# semantics of CLAUDE_GOAL_AUDIT_DISABLE=1 for backward compat).
+AUDIT_MODES = {"adversarial", "self", "off"}
 
 # Adversarial auditor settings. Auditor runs `claude -p` in a fresh process
 # so it can't see the worker's reasoning; only the objective + the repo.
@@ -106,6 +116,161 @@ def cwd_session_id(cwd: str | None) -> str | None:
     if not cwd:
         return None
     return "cwd:" + hashlib.sha256(cwd.encode()).hexdigest()[:16]
+
+
+# --- Config loader -------------------------------------------------------
+
+# Defaults live here so `load_config()` is the single source of truth; the
+# TOML file and env vars only express deltas.
+_AUDIT_DEFAULTS: dict[str, Any] = {
+    "mode": "adversarial",
+    "model": "sonnet",
+    "timeout": 180,
+}
+
+
+def _read_toml_config() -> dict[str, Any]:
+    """Read ~/.claude/goal/config.toml if present and tomllib is available.
+
+    Returns the raw parsed dict (potentially empty). Never raises; malformed
+    TOML or absent tomllib both fall through to an empty dict so env vars
+    and defaults can still produce a valid config.
+    """
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        import tomllib  # Python 3.11+
+    except ImportError:
+        return {}
+    try:
+        with open(CONFIG_PATH, "rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, Exception):  # tomllib.TOMLDecodeError is a subclass of Exception
+        return {}
+
+
+def load_config() -> dict[str, Any]:
+    """Compose the effective audit config: defaults + TOML + env overrides.
+
+    The returned dict always has concrete values for mode / model / timeout.
+    Validation happens here too — invalid enum values fall back to defaults
+    with a warning printed to stderr, not a raised exception, so a malformed
+    config never breaks the CLI.
+    """
+    toml_data = _read_toml_config()
+    audit_toml = toml_data.get("audit", {}) if isinstance(toml_data, dict) else {}
+    if not isinstance(audit_toml, dict):
+        audit_toml = {}
+
+    config: dict[str, Any] = dict(_AUDIT_DEFAULTS)
+    for key in _AUDIT_DEFAULTS:
+        if key in audit_toml:
+            config[key] = audit_toml[key]
+
+    # Env vars override TOML.
+    env_mode = os.environ.get("CLAUDE_GOAL_AUDIT_MODE")
+    if env_mode:
+        config["mode"] = env_mode
+    # Legacy alias: CLAUDE_GOAL_AUDIT_DISABLE=1 → mode=off. Only apply when
+    # the newer CLAUDE_GOAL_AUDIT_MODE isn't explicitly set, so a user can
+    # still override the old setting without unsetting it.
+    elif os.environ.get("CLAUDE_GOAL_AUDIT_DISABLE") == "1":
+        config["mode"] = "off"
+    if os.environ.get("CLAUDE_GOAL_AUDIT_MODEL"):
+        config["model"] = os.environ["CLAUDE_GOAL_AUDIT_MODEL"]
+    if os.environ.get("CLAUDE_GOAL_AUDIT_TIMEOUT"):
+        try:
+            config["timeout"] = int(os.environ["CLAUDE_GOAL_AUDIT_TIMEOUT"])
+        except ValueError:
+            pass
+
+    # Validation: bad mode → fall back to default with a visible warning.
+    if config["mode"] not in AUDIT_MODES:
+        print(
+            f"goal warning: audit.mode={config['mode']!r} is not one of "
+            f"{sorted(AUDIT_MODES)}; falling back to {_AUDIT_DEFAULTS['mode']!r}",
+            file=sys.stderr,
+        )
+        config["mode"] = _AUDIT_DEFAULTS["mode"]
+    try:
+        config["timeout"] = int(config["timeout"])
+        if config["timeout"] <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        config["timeout"] = _AUDIT_DEFAULTS["timeout"]
+    if not isinstance(config["model"], str) or not config["model"].strip():
+        config["model"] = _AUDIT_DEFAULTS["model"]
+
+    return config
+
+
+def write_config(key: str, value: str) -> dict[str, Any]:
+    """Persist a single audit.<key> value to the TOML config file.
+
+    Creates the file if absent. Returns the effective config after the write.
+    Validation mirrors load_config(): mode must be in AUDIT_MODES, timeout
+    must be a positive int, model must be a non-empty string.
+    """
+    allowed_keys = set(_AUDIT_DEFAULTS.keys())
+    if "." in key:
+        section, field = key.split(".", 1)
+        if section != "audit" or field not in allowed_keys:
+            raise ValueError(
+                f"unknown config key {key!r}; valid keys: "
+                + ", ".join(f"audit.{k}" for k in sorted(allowed_keys))
+            )
+        field_name = field
+    else:
+        raise ValueError(f"config key must be of the form audit.<field>, got {key!r}")
+
+    # Type-coerce and validate before persisting.
+    coerced: Any
+    if field_name == "mode":
+        if value not in AUDIT_MODES:
+            raise ValueError(
+                f"audit.mode must be one of {sorted(AUDIT_MODES)}, got {value!r}"
+            )
+        coerced = value
+    elif field_name == "timeout":
+        try:
+            coerced = int(value)
+        except ValueError as exc:
+            raise ValueError(f"audit.timeout must be an integer, got {value!r}") from exc
+        if coerced <= 0:
+            raise ValueError(f"audit.timeout must be positive, got {coerced}")
+    elif field_name == "model":
+        if not value.strip():
+            raise ValueError("audit.model must be non-empty")
+        coerced = value.strip()
+    else:
+        coerced = value
+
+    existing = _read_toml_config()
+    if not isinstance(existing, dict):
+        existing = {}
+    audit_section = existing.get("audit", {})
+    if not isinstance(audit_section, dict):
+        audit_section = {}
+    audit_section[field_name] = coerced
+    existing["audit"] = audit_section
+
+    # Serialize by hand. tomllib can read but can't write; avoiding a
+    # third-party dep keeps the script zero-install.
+    lines: list[str] = []
+    lines.append("[audit]")
+    for k in sorted(audit_section.keys()):
+        v = audit_section[k]
+        if isinstance(v, bool):
+            lines.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, int):
+            lines.append(f"{k} = {v}")
+        else:
+            # Strings: escape double-quotes and backslashes.
+            escaped = str(v).replace("\\", "\\\\").replace("\"", "\\\"")
+            lines.append(f'{k} = "{escaped}"')
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text("\n".join(lines) + "\n")
+    return load_config()
 
 
 def sqlite_connect(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -946,7 +1111,7 @@ def _fake_audit_from_env() -> AuditResult | None:
     )
 
 
-def run_audit(objective: str, cwd: str) -> AuditResult:
+def run_audit(objective: str, cwd: str, *, config: dict[str, Any] | None = None) -> AuditResult:
     """Spawn a fresh `claude -p` process as an adversarial auditor.
 
     Returns an AuditResult. Never raises on auditor failure; errors are
@@ -963,11 +1128,12 @@ def run_audit(objective: str, cwd: str) -> AuditResult:
             "`claude` CLI not found on PATH; install Claude Code or rerun with --force"
         )
 
-    model = os.environ.get("CLAUDE_GOAL_AUDIT_MODEL", AUDIT_MODEL_DEFAULT)
-    try:
-        timeout = int(os.environ.get("CLAUDE_GOAL_AUDIT_TIMEOUT", AUDIT_TIMEOUT_DEFAULT))
-    except ValueError:
-        timeout = AUDIT_TIMEOUT_DEFAULT
+    # Pull tunables from the effective config (TOML + env override). A caller
+    # can thread one in; otherwise we compose it here.
+    if config is None:
+        config = load_config()
+    model = str(config.get("model") or AUDIT_MODEL_DEFAULT)
+    timeout = int(config.get("timeout") or AUDIT_TIMEOUT_DEFAULT)
 
     escaped_objective = escape_xml_text(objective)
     user_prompt = AUDIT_USER_PROMPT.format(objective=escaped_objective, cwd=cwd)
@@ -1100,12 +1266,19 @@ def _clear_audit_feedback(conn: sqlite3.Connection, goal_row_id: str) -> None:
 
 
 def complete_goal(conn: sqlite3.Connection, sid: str, *, force: bool = False) -> tuple[sqlite3.Row, AuditResult | None]:
-    """Gate `/goal complete` behind an adversarial audit.
+    """Gate `/goal complete` on the configured audit mode.
 
-    Returns (row, audit_result). `audit_result` is None when the audit was
-    skipped (--force or CLAUDE_GOAL_AUDIT_DISABLE=1) or when the goal was
-    already complete. On a failing audit the row is reverted to `active` with
-    `audit_feedback` populated; the caller should surface the findings.
+    Modes:
+      - adversarial (default): spawn `claude -p` with a hostile prompt,
+        read-only tools, independent session. Worker cannot lie to itself.
+      - self: no subprocess. Trusts the worker's own completion claim.
+        Equivalent to pre-audit codex behavior. Logs `self_audit`.
+      - off: no audit at all. Preserves CLAUDE_GOAL_AUDIT_DISABLE=1 semantics
+        for backward compatibility. Logs `force_complete`.
+
+    Returns (row, audit_result). `audit_result` is populated only in
+    adversarial mode when the auditor actually ran. On a failing audit
+    the row is reverted to `active` with `audit_feedback` populated.
     """
     goal = find_goal(conn, candidate_session_ids())
     if not goal:
@@ -1115,14 +1288,12 @@ def complete_goal(conn: sqlite3.Connection, sid: str, *, force: bool = False) ->
     if goal["status"] == "complete":
         return goal, None
 
-    audit_disabled = os.environ.get("CLAUDE_GOAL_AUDIT_DISABLE") == "1"
-    if force:
-        # --force requires the user to have set CLAUDE_GOAL_FORCE_OK=1 before
-        # launching Claude Code. Claude Code does not propagate arbitrary env
-        # vars into the skill's Bash-tool subprocess, so a drifting worker
-        # cannot set this itself — only the user can. This closes the hole
-        # where a worker, seeing an auditor error, rationalizes
-        # "--force is warranted" and calls it without user involvement.
+    config = load_config()
+    mode = config["mode"]
+
+    # --force handling: only meaningful in adversarial mode. In self/off
+    # the audit doesn't run anyway, so --force is a silent no-op.
+    if force and mode == "adversarial":
         if os.environ.get("CLAUDE_GOAL_FORCE_OK") != "1":
             raise ValueError(
                 "--force is blocked: the adversarial audit is the safety net, "
@@ -1132,20 +1303,34 @@ def complete_goal(conn: sqlite3.Connection, sid: str, *, force: bool = False) ->
                 "`/goal complete --force`. For most audit failures, the right "
                 "answer is to fix the missing items the auditor identified."
             )
-    if force or audit_disabled:
-        detail = "force" if force else "audit_disabled_env"
-        event(conn, goal["session_id"], "force_complete", detail, goal["id"])
+        event(conn, goal["session_id"], "force_complete", "force", goal["id"])
         row = update_status(conn, sid, "complete")
         _clear_audit_feedback(conn, row["id"])
         return get_goal(conn, row["session_id"]), None  # type: ignore[return-value]
 
-    # Move to pending_audit first so a concurrent Stop hook sees the right
-    # state, account wall-clock time as usual, then run the audit.
+    if mode == "off":
+        # Preserve the behavior of the legacy CLAUDE_GOAL_AUDIT_DISABLE=1.
+        event(conn, goal["session_id"], "force_complete", "audit_off_mode", goal["id"])
+        row = update_status(conn, sid, "complete")
+        _clear_audit_feedback(conn, row["id"])
+        return get_goal(conn, row["session_id"]), None  # type: ignore[return-value]
+
+    if mode == "self":
+        # Codex-style: the worker marks itself complete after running the
+        # 7-bullet audit in the continuation prompt. No independent check.
+        event(conn, goal["session_id"], "self_audit", "mode=self", goal["id"])
+        row = update_status(conn, sid, "complete")
+        _clear_audit_feedback(conn, row["id"])
+        return get_goal(conn, row["session_id"]), None  # type: ignore[return-value]
+
+    # mode == "adversarial": move to pending_audit first so a concurrent Stop
+    # hook sees the right state, account wall-clock time as usual, then run
+    # the audit.
     pending = update_status(conn, sid, "pending_audit")
     event(conn, pending["session_id"], "audit_start", goal_id=pending["id"])
 
     cwd = os.environ.get("PWD") or str(Path.cwd())
-    result = run_audit(pending["objective"], cwd)
+    result = run_audit(pending["objective"], cwd, config=config)
     _store_audit_result(conn, pending["id"], result)
 
     if result.verdict == "pass":
@@ -1269,12 +1454,65 @@ def _split_force_flag(raw_args: str) -> tuple[str, bool]:
     return " ".join(rest), force
 
 
+def _format_config_list(config: dict[str, Any]) -> str:
+    """Pretty-print the effective audit config in `key = value` form.
+
+    Shows the composed result (defaults + TOML + env override), followed by
+    a hint about where the on-disk TOML lives.
+    """
+    lines = ["Audit configuration (effective):"]
+    for key in sorted(config.keys()):
+        lines.append(f"  audit.{key} = {config[key]}")
+    lines.append("")
+    lines.append(f"Config file: {CONFIG_PATH}")
+    lines.append("(Environment variables CLAUDE_GOAL_AUDIT_MODE / _MODEL / _TIMEOUT override the file.)")
+    return "\n".join(lines)
+
+
+def config_subcommand(argv: list[str]) -> str:
+    """Implement `/goal config {get|set|list}`.
+
+    Shapes:
+      config list
+      config get <audit.key>
+      config set <audit.key> <value>
+    """
+    if not argv or argv[0] in ("list", "show"):
+        return _format_config_list(load_config())
+    action = argv[0]
+    if action == "get":
+        if len(argv) < 2:
+            raise ValueError("config get requires a key, e.g. `config get audit.mode`")
+        key = argv[1]
+        config = load_config()
+        if not key.startswith("audit.") or key.split(".", 1)[1] not in config:
+            raise ValueError(
+                f"unknown config key {key!r}; valid keys: "
+                + ", ".join(f"audit.{k}" for k in sorted(config.keys()))
+            )
+        return f"{key} = {config[key.split('.', 1)[1]]}"
+    if action == "set":
+        if len(argv) < 3:
+            raise ValueError("config set requires a key and a value, e.g. `config set audit.mode self`")
+        key, value = argv[1], argv[2]
+        updated = write_config(key, value)
+        return (
+            f"{key} = {value} (written to {CONFIG_PATH})\n\n"
+            + _format_config_list(updated)
+        )
+    raise ValueError(f"unknown config action {action!r}; expected get, set, or list")
+
+
 def invoke(raw_args: str) -> str:
     sid = session_id()
+    raw_args = (raw_args or "").strip()
+    command = raw_args.split(maxsplit=1)[0].lower() if raw_args else "status"
+    rest = raw_args.split(maxsplit=1)[1] if " " in raw_args else ""
+    # `config` doesn't need a DB connection and operates purely on the
+    # filesystem, so route it before opening SQLite.
+    if command == "config":
+        return config_subcommand(shlex.split(rest) if rest else [])
     with sqlite_connect() as conn:
-        raw_args = (raw_args or "").strip()
-        command = raw_args.split(maxsplit=1)[0].lower() if raw_args else "status"
-        rest = raw_args.split(maxsplit=1)[1] if " " in raw_args else ""
         if command in {"status", "show", "get", "menu"}:
             return render_invoke_result("status", find_goal(conn, candidate_session_ids()))
         if command == "pause":
@@ -1440,6 +1678,8 @@ def main(argv: list[str]) -> int:
     p_tokens.add_argument("delta", type=int)
     sub.add_parser("stop-hook")
     sub.add_parser("session-start-hook", help="SessionStart hook: propagate CLAUDE_SESSION_ID into Bash env")
+    p_config = sub.add_parser("config", help="Get, set, or list audit config (mode / model / timeout)")
+    p_config.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
     try:
@@ -1481,6 +1721,8 @@ def main(argv: list[str]) -> int:
             return stop_hook()
         elif args.cmd == "session-start-hook":
             return session_start_hook()
+        elif args.cmd == "config":
+            print(config_subcommand(list(args.args)))
         else:
             parser.print_help()
             return 2
