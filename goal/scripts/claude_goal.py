@@ -33,7 +33,32 @@ STATUS_LABELS = {
     "pending_audit": "audit pending",
 }
 MAX_OBJECTIVE_CHARS = 4000
-STATE_DIR = Path(os.environ.get("CLAUDE_GOAL_HOME", Path.home() / ".claude" / "goal"))
+
+
+def _default_state_dir() -> Path:
+    """Default root for goal state. Priority:
+
+    1. CLAUDE_GOAL_HOME — explicit user override. Tests and power users.
+    2. CLAUDE_PLUGIN_DATA — set by Claude Code when the plugin is loaded.
+       Lands at ~/.claude/plugins/data/<plugin-id>/ and survives updates.
+    3. ~/.claude/goal — legacy default for standalone CLI use outside the
+       plugin system.
+
+    The plugin path wins over the legacy path because running inside Claude
+    Code (the expected mode) should route state through the plugin-managed
+    directory. If neither env var is set we fall back to the legacy location
+    so someone running this script directly from a git checkout still works.
+    """
+    home = os.environ.get("CLAUDE_GOAL_HOME")
+    if home:
+        return Path(home)
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if plugin_data:
+        return Path(plugin_data)
+    return Path.home() / ".claude" / "goal"
+
+
+STATE_DIR = _default_state_dir()
 DB_PATH = Path(os.environ.get("CLAUDE_GOAL_DB", STATE_DIR / "goals.sqlite"))
 # Marker file: exists iff at least one goal in the DB is active or pending_audit.
 # The Stop hook stats this before opening SQLite so sessions without any active
@@ -889,7 +914,7 @@ Before deciding that the goal is achieved, perform a completion audit against th
 - Identify any missing, incomplete, weakly verified, or uncovered requirement.
 - Treat uncertainty as not achieved; do more verification or continue the work.
 
-Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, run `python3 ~/.claude/skills/goal/scripts/claude_goal.py complete` so usage accounting is preserved. Report the final elapsed time, and if the achieved goal has a token budget, report the final consumed token budget to the user after the complete command succeeds.
+Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, run `python3 "$CLAUDE_PLUGIN_ROOT/goal/scripts/claude_goal.py" complete` so usage accounting is preserved. Report the final elapsed time, and if the achieved goal has a token budget, report the final consumed token budget to the user after the complete command succeeds.
 
 Do not run the complete command unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
 """

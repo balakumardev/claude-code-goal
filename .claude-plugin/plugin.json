@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "claude-code-goal",
+  "version": "0.1.0",
+  "description": "Persistent /goal command for Claude Code. Holds a long-running objective across turns, auto-continues via a Stop hook, and gates completion behind a configurable audit (default: an adversarial second Claude session that proves the objective was met).",
+  "author": {
+    "name": "Bala Kumar",
+    "email": "mail@balakumar.dev",
+    "url": "https://balakumar.dev"
+  },
+  "homepage": "https://github.com/balakumardev/claude-code-goal",
+  "repository": "https://github.com/balakumardev/claude-code-goal",
+  "license": "MIT",
+  "keywords": [
+    "goal",
+    "objective",
+    "audit",
+    "long-running",
+    "codex"
+  ],
+  "skills": ["./"],
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/goal/scripts/claude_goal.py stop-hook"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/goal/scripts/claude_goal.py session-start-hook"
+          }
+        ]
+      }
+    ]
+  }
+}

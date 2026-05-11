@@ -9,7 +9,7 @@ argument-hint: "[status|pause|resume|clear|complete] [--tokens N] <objective>"
 **IMMEDIATELY** run the helper with whatever arguments the user passed. Do NOT ask the user any questions. Do NOT enter plan mode. Do NOT summarize the arguments first. Just run the command.
 
 ```bash
-python3 ~/.claude/skills/goal/scripts/claude_goal.py invoke "$ARGUMENTS"
+python3 "$CLAUDE_PLUGIN_ROOT/goal/scripts/claude_goal.py" invoke "$ARGUMENTS"
 ```
 
 The helper's stdout contains everything you need:

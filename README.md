@@ -6,25 +6,16 @@ It gives Claude Code a persistent local goal state, Codex-verbatim continuation 
 
 ## Install
 
-```bash
-git clone https://github.com/balakumardev/claude-code-goal.git
-cd claude-code-goal
-./install.sh
-```
-
-This installs:
-
-- `~/.claude/skills/goal` as a symlink to this repo's `goal/` directory
-- a user-level Claude Code `Stop` hook in `~/.claude/settings.json`
-- a user-level Claude Code `SessionStart` hook that exports `CLAUDE_SESSION_ID` into each session's Bash env, so parallel Claude Code sessions stay isolated even when `TERM_SESSION_ID` isn't reliable (tmux, ssh, VS Code terminals).
-
-The `goal/` directory is the Claude skill package. It contains `SKILL.md`, `scripts/claude_goal.py`, and reference notes.
-
-State is stored at:
+This ships as a Claude Code plugin. From inside Claude Code:
 
 ```text
-~/.claude/goal/goals.sqlite
+/plugin marketplace add balakumardev/claude
+/plugin install claude-code-goal
 ```
+
+That's it. Claude Code pulls the plugin, registers the `/goal` skill, and wires up the two hooks (`Stop` to auto-continue, `SessionStart` to anchor parallel sessions). To update later: `/plugin marketplace update balakumar` then `/plugin install claude-code-goal` again.
+
+State is stored at `~/.claude/plugins/data/claude-code-goal-balakumar/` (or `$CLAUDE_GOAL_HOME` if you override it). The SQLite database, marker file, and TOML config all live there.
 
 ## Usage
 
@@ -46,7 +37,7 @@ When a goal is active, `/goal` returns the Codex-verbatim continuation prompt: o
 If `tokens_used` crosses `token_budget`, the goal auto-transitions to `budget_limited` and the helper returns the budget-limit prompt instead (wrap up, summarize, leave a clear next step). You can feed token usage in via:
 
 ```bash
-python3 ~/.claude/skills/goal/scripts/claude_goal.py add-tokens <N>
+python3 "$CLAUDE_PLUGIN_ROOT/goal/scripts/claude_goal.py" add-tokens <N>
 ```
 
 ## Completion audit
@@ -87,7 +78,7 @@ Tune the auditor via environment variables:
 
 ## Configuration
 
-Persistent configuration lives at `~/.claude/goal/config.toml` (override the directory with `CLAUDE_GOAL_HOME`, or point at a different file with `CLAUDE_GOAL_CONFIG`). Example:
+Persistent configuration lives at `$CLAUDE_GOAL_HOME/config.toml` — by default that resolves to `~/.claude/plugins/data/claude-code-goal-balakumar/config.toml` when installed as a plugin. Override the directory with `CLAUDE_GOAL_HOME`, or point at a different file with `CLAUDE_GOAL_CONFIG`. Example:
 
 ```toml
 [audit]
@@ -134,7 +125,7 @@ The Stop hook blocks Claude from stopping while the current goal is `active` or 
 The skill is designed to work across many concurrent Claude Code sessions:
 
 - Each session is keyed by its real Claude Code session id (`CLAUDE_SESSION_ID`) via the `SessionStart` hook, so two sessions in the same repo / terminal tab never collide.
-- The Stop hook stats a marker file at `~/.claude/goal/.active` before touching SQLite — sessions without any active goal pay one syscall per turn, not a DB open.
+- The Stop hook stats a marker file at `$CLAUDE_GOAL_HOME/.active` before touching SQLite — sessions without any active goal pay one syscall per turn, not a DB open.
 - The `events` table carries a composite index on `(goal_id, event, created_at)` so the runaway-guard query stays fast under heavy use. Events older than 30 days are GC'd on every `/goal clear` and successful `/goal complete`.
 
 By default, the runaway guard allows up to 500 Stop-hook continuations for a single active goal. That high default is intentional: `/goal` is meant for long-running work where Claude may need many turns to finish. If you want a stricter cap, set `CLAUDE_GOAL_MAX_STOP_CONTINUES` before launching Claude Code:
